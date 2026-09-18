@@ -52,6 +52,78 @@ export const principalFromAccessClaims = (
   };
 };
 
+/** Header naming the subject a trusted delegating caller is acting for. */
+export const DELEGATED_SUBJECT_HEADER = "X-Executor-Subject";
+/** Header carrying that subject's email, so roles resolve as they would in a browser. */
+export const DELEGATED_EMAIL_HEADER = "X-Executor-Subject-Email";
+
+/** The delegation a request asserts, read straight off the headers (both null on
+ *  an ordinary request). */
+export interface DelegatedIdentity {
+  readonly subject: string | null;
+  readonly email: string | null;
+}
+
+export const readDelegatedIdentity = (request: Request): DelegatedIdentity => ({
+  subject: request.headers.get(DELEGATED_SUBJECT_HEADER),
+  email: request.headers.get(DELEGATED_EMAIL_HEADER),
+});
+
+/**
+ * Re-bind a verified principal to the subject a TRUSTED service token says it is
+ * acting for. Cloudflare Access authenticates browsers and machines, but has no
+ * way to express "this backend is acting for Alice" — a service token's identity
+ * is the token. Without this, a headless agent can only ever reach `owner: "org"`
+ * rows, because its subject never matches any human's.
+ *
+ * The gate, in order:
+ *   - no delegation headers at all → the principal passes through untouched;
+ *   - the caller is NOT the one configured delegator → `null`, i.e. REJECT the
+ *     request. Silently ignoring the header would let any Access-authenticated
+ *     human probe for delegation and learn whether it is enabled;
+ *   - a delegator that names no subject → `null`, for the same reason.
+ *
+ * Only a service token may delegate: a human principal always carries an `email`,
+ * so requiring an empty one means a browser session can never delegate even if it
+ * somehow learned the delegator's id.
+ *
+ * Roles MIRROR the delegated human's real standing, so the agent reaches exactly
+ * what that person reaches in a browser. Note the one asymmetry: Access `groups`
+ * are not available to the delegator, so a delegated principal gets admin from the
+ * email allowlist but never group-derived roles.
+ *
+ * Pure (no request, no IO) so it is unit-testable, like `principalFromAccessClaims`.
+ */
+export const applyDelegatedSubject = (
+  principal: Principal,
+  config: CloudflareConfig,
+  delegated: DelegatedIdentity,
+): Principal | null => {
+  const subject = delegated.subject?.trim() ?? "";
+  const email = delegated.email?.trim() ?? "";
+  if (subject.length === 0 && email.length === 0) return principal;
+
+  const delegator = config.accessDelegationCommonName ?? "";
+  const mayDelegate =
+    delegator.length > 0 && principal.email.length === 0 && principal.accountId === delegator;
+  if (!mayDelegate) return null;
+  if (subject.length === 0) return null;
+
+  const isAdmin = email.length > 0 && config.adminEmails.includes(email.toLowerCase());
+  return {
+    ...principal,
+    accountId: subject,
+    email,
+    name: email.length > 0 ? email : subject,
+    roles: isAdmin ? ["admin"] : ["member"],
+    // Restated rather than left to the spread: `Principal` discriminates `orgRole`
+    // on `orgRoleModel`, so the spread alone leaves the union open and `orgRole`
+    // unassignable. This host only ever builds the "organization" arm.
+    orgRoleModel: "organization",
+    orgRole: isAdmin ? "admin" : "member",
+  };
+};
+
 /**
  * Resolve a request to its verified `Principal`, or `null` when the Access
  * assertion is missing/invalid. The single source of truth for "who is this
@@ -97,7 +169,13 @@ export const makeAccessVerifier = (config: CloudflareConfig) => {
       }).pipe(Effect.orElseSucceed(() => null));
       if (!verified) return null;
 
-      return principalFromAccessClaims(verified.payload as Record<string, unknown>, config);
+      const principal = principalFromAccessClaims(
+        verified.payload as Record<string, unknown>,
+        config,
+      );
+      // Delegation runs AFTER verification, never instead of it: the caller is
+      // always a fully verified Access principal first.
+      return applyDelegatedSubject(principal, config, readDelegatedIdentity(request));
     });
 
   return { verify };

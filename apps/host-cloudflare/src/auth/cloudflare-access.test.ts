@@ -3,7 +3,7 @@ import { describe, expect, it } from "@effect/vitest";
 import { orgWriteAccessForPrincipal } from "@executor-js/host-mcp";
 
 import type { CloudflareConfig } from "../config";
-import { principalFromAccessClaims } from "./cloudflare-access";
+import { applyDelegatedSubject, principalFromAccessClaims } from "./cloudflare-access";
 
 const config: CloudflareConfig = {
   accessTeamDomain: "team.cloudflareaccess.com",
@@ -57,5 +57,66 @@ describe("principalFromAccessClaims", () => {
     expect(p.orgRoleModel).toBe("organization");
     expect(p.orgRole).toBe("member");
     expect(orgWriteAccessForPrincipal(p)).toBe("denied");
+  });
+});
+
+const DELEGATOR = "agent-token.access";
+const delegating: CloudflareConfig = { ...config, accessDelegationCommonName: DELEGATOR };
+
+// The delegator itself: a service-token principal, exactly as Access presents one.
+const delegatorPrincipal = () =>
+  principalFromAccessClaims({ common_name: DELEGATOR, type: "app" }, delegating);
+
+describe("applyDelegatedSubject", () => {
+  it("passes an ordinary request through untouched", () => {
+    const p = principalFromAccessClaims({ sub: "user-123", email: "person@example.com" }, config);
+    expect(applyDelegatedSubject(p, config, { subject: null, email: null })).toBe(p);
+  });
+
+  it("re-binds the trusted delegator to the named subject", () => {
+    const p = applyDelegatedSubject(delegatorPrincipal(), delegating, {
+      subject: "alice-access-sub",
+      email: "alice@example.com",
+    });
+    expect(p?.accountId).toBe("alice-access-sub");
+    expect(p?.email).toBe("alice@example.com");
+    expect(p?.roles).toEqual(["member"]);
+  });
+
+  it("mirrors the delegated human's admin standing", () => {
+    const p = applyDelegatedSubject(delegatorPrincipal(), delegating, {
+      subject: "admin-access-sub",
+      email: "ADMIN@example.com",
+    });
+    expect(p?.roles).toContain("admin");
+    expect(p?.orgRole).toBe("admin");
+  });
+
+  it("REJECTS a human trying to delegate, rather than ignoring the header", () => {
+    const human = principalFromAccessClaims({ sub: "u", email: "person@example.com" }, delegating);
+    expect(applyDelegatedSubject(human, delegating, { subject: "alice", email: null })).toBeNull();
+  });
+
+  it("REJECTS an admin human trying to delegate", () => {
+    const admin = principalFromAccessClaims({ sub: "u", email: "admin@example.com" }, delegating);
+    expect(applyDelegatedSubject(admin, delegating, { subject: "alice", email: null })).toBeNull();
+  });
+
+  it("REJECTS a service token that is not the configured delegator", () => {
+    const other = principalFromAccessClaims({ common_name: "other.access" }, delegating);
+    expect(applyDelegatedSubject(other, delegating, { subject: "alice", email: null })).toBeNull();
+  });
+
+  it("REJECTS delegation when no delegator is configured", () => {
+    const token = principalFromAccessClaims({ common_name: DELEGATOR }, config);
+    expect(applyDelegatedSubject(token, config, { subject: "alice", email: null })).toBeNull();
+  });
+
+  it("REJECTS a delegator that names an email but no subject", () => {
+    const p = applyDelegatedSubject(delegatorPrincipal(), delegating, {
+      subject: "   ",
+      email: "alice@example.com",
+    });
+    expect(p).toBeNull();
   });
 });

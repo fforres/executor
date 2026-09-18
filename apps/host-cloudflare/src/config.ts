@@ -40,6 +40,13 @@ export interface CloudflareEnv {
   readonly ACCESS_GROUPS_CLAIM?: string;
   /** Comma-separated emails granted the admin role. */
   readonly ADMIN_EMAILS?: string;
+  /**
+   * The `common_name` of the ONE Access service token allowed to act on behalf
+   * of another subject (see `applyDelegatedSubject`). Unset disables delegation
+   * entirely, which is the correct default: an instance with no headless agent
+   * in front of it should never accept a delegated subject.
+   */
+  readonly ACCESS_DELEGATION_COMMON_NAME?: string;
   /** The single organization id/name every authenticated user belongs to. */
   readonly SELF_HOSTED_ORG_ID?: string;
   readonly SELF_HOSTED_ORG_NAME?: string;
@@ -64,6 +71,9 @@ export interface CloudflareConfig {
   readonly accessNameClaim: string;
   readonly accessGroupsClaim: string;
   readonly adminEmails: readonly string[];
+  /** See {@link CloudflareEnv.ACCESS_DELEGATION_COMMON_NAME}. Optional so an
+   *  instance that never delegates carries no extra configuration. */
+  readonly accessDelegationCommonName?: string;
   readonly organizationId: string;
   readonly organizationName: string;
   /** URL slug for org-prefixed console paths (`/<slug>/policies`). */
@@ -161,6 +171,7 @@ export const loadConfig = (env: CloudflareConfigEnv): CloudflareConfig => {
     accessNameClaim: env.ACCESS_NAME_CLAIM ?? "name",
     accessGroupsClaim: env.ACCESS_GROUPS_CLAIM ?? "groups",
     adminEmails: splitLower(env.ADMIN_EMAILS),
+    accessDelegationCommonName: env.ACCESS_DELEGATION_COMMON_NAME?.trim() || undefined,
     organizationId: env.SELF_HOSTED_ORG_ID ?? "default",
     organizationName: env.SELF_HOSTED_ORG_NAME ?? "Default",
     organizationSlug: resolveOrgSlug(env.SELF_HOSTED_ORG_SLUG),
