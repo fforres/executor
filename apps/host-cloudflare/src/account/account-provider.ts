@@ -4,6 +4,7 @@ import {
   AccountProvider,
   accountProviderMiddlewareLayer,
   type AccountHeaders,
+  type Principal,
 } from "@executor-js/api/server";
 import { AccountError, AccountUnauthorized } from "@executor-js/api";
 
@@ -21,9 +22,43 @@ import type { CloudflareConfig } from "../config";
 // shows no members page, so those methods are never reached from the UI; they
 // return empty (reads) or a clear "managed by Cloudflare Access" error (writes)
 // to satisfy the provider shape.
+//
+// `listMembers` is the ONE exception, and it is load-bearing. The console
+// carries no role on the session (`/account/me` returns a user and an
+// organization, never a role), so the shell derives "am I an admin" by finding
+// the `isCurrentUser` row in this list and reading its role. Returning an empty
+// list therefore made EVERY Access user a non-admin in the UI — which silently
+// removed the Workspace (`owner: "org"`) choice from the connection-create flow,
+// leaving personal connections as the only thing anyone could make, however
+// `ADMIN_EMAILS` was set. So we project the Access principal into a single
+// member row. There is no directory to enumerate here (Access owns membership),
+// so the list is exactly one row: whoever is asking.
 // ---------------------------------------------------------------------------
 
 const NOT_IN_APP = "Managed by Cloudflare Access, not in the app.";
+
+/**
+ * Project an Access principal into the ONE member row this host reports.
+ *
+ * `role` mirrors the Access-derived org role (`ADMIN_EMAILS` plus the groups
+ * claim), so "admin" in the console means admin at the server gate too, instead
+ * of the two disagreeing. `status` is always `"active"`: Access has no pending
+ * state — a principal either passed the Access policy or never reached us.
+ *
+ * Pure (no headers, no IO) so it is unit-testable, like
+ * `principalFromAccessClaims` in ../auth/cloudflare-access.
+ */
+export const memberRowFromPrincipal = (principal: Principal) => ({
+  id: principal.accountId,
+  userId: principal.accountId,
+  email: principal.email,
+  name: principal.name,
+  avatarUrl: principal.avatarUrl,
+  role: principal.orgRole === "admin" ? "admin" : "member",
+  status: "active",
+  lastActiveAt: null,
+  isCurrentUser: true,
+});
 
 export const cloudflareAccountProvider = (
   config: CloudflareConfig,
@@ -66,7 +101,12 @@ export const cloudflareAccountProvider = (
     listOrgApiKeys: () => Effect.succeed({ apiKeys: [] }),
     createOrgApiKey: () => forbiddenWrite,
     revokeOrgApiKey: () => forbiddenWrite,
-    listMembers: () => Effect.succeed({ members: [] }),
+    listMembers: (headers) =>
+      principalFrom(headers).pipe(
+        Effect.map((principal) =>
+          principal ? { members: [memberRowFromPrincipal(principal)] } : { members: [] },
+        ),
+      ),
     listRoles: () => Effect.succeed({ roles: [] }),
     inviteMember: () => forbiddenWrite,
     removeMember: () => forbiddenWrite,
