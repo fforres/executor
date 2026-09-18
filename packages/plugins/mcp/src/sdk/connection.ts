@@ -547,6 +547,28 @@ const connectClient = (input: {
 // Public factory
 // ---------------------------------------------------------------------------
 
+/** The OpenAPI plugin defaults its own User-Agent for the same reason and sends
+ *  `"executor"` (see its `DEFAULT_USER_AGENT`). The two values deliberately
+ *  differ so MCP traffic is distinguishable in an upstream's logs; converge them
+ *  if that ever stops being worth the second string to allowlist. */
+const DEFAULT_USER_AGENT = "skywardai-ua";
+
+/** Default a User-Agent into a remote MCP server's headers.
+ *
+ *  Workers' `fetch` sends NO User-Agent, and some providers' edge/WAF answer a
+ *  UA-less request with 403 BEFORE auth is evaluated (Vercel-fronted MCP servers
+ *  do this), which reads downstream as a credential failure. Only the header's
+ *  PRESENCE matters. An explicitly configured User-Agent always wins, matched
+ *  case-insensitively because HTTP header names are — a plain spread default
+ *  would leave both keys and the wire value would become "default, configured".
+ */
+export const withDefaultUserAgent = (
+  headers: Readonly<Record<string, string>>,
+): Record<string, string> =>
+  Object.keys(headers).some((name) => name.toLowerCase() === "user-agent")
+    ? { ...headers }
+    : { ...headers, "User-Agent": DEFAULT_USER_AGENT };
+
 export const createMcpConnector = (input: ConnectorInput): McpConnector => {
   if (input.transport === "stdio") {
     const command = input.command.trim();
@@ -626,9 +648,9 @@ export const createMcpConnector = (input: ConnectorInput): McpConnector => {
   }
 
   // Remote transport
-  const headers = input.headers ?? {};
+  const headers = withDefaultUserAgent(input.headers ?? {});
   const remoteTransport = input.remoteTransport ?? "auto";
-  const requestInit = Object.keys(headers).length > 0 ? { headers } : undefined;
+  const requestInit = { headers };
   const fetch = input.httpClientLayer
     ? fetchFromHttpClientLayer(input.httpClientLayer, input.staticOAuthBearer === true)
     : undefined;
