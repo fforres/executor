@@ -28,7 +28,7 @@ describe("memberRowFromPrincipal", () => {
     expect(row.role).toBe("admin");
     expect(row.status).toBe("active");
     expect(row.isCurrentUser).toBe(true);
-    expect(row.userId).toBe("felipe-sub");
+    expect(row.userId).toBe("felipe@skyward.ai");
     // These three fields together are exactly what the shell's
     // isTenantAdminMember() requires before it offers the Workspace connection
     // owner (packages/react/src/lib/admin-access.ts). Not imported here: that is

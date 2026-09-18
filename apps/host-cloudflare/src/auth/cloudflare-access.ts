@@ -18,12 +18,28 @@ import type { CloudflareConfig } from "../config";
 // ---------------------------------------------------------------------------
 
 /**
+ * Normalize an identity value into the key ownership is stored under. Lowercased
+ * and trimmed so the same person is one account however their IdP happens to
+ * capitalize them; every value that reaches here (email, Access UUID, service
+ * token common name) is case-insensitive in its own right.
+ */
+const identityKey = (value: string): string => value.trim().toLowerCase();
+
+/**
  * Map verified Access JWT claims onto the neutral `Principal`. Pure (no JWT
  * verification) so it is unit-testable. Handles both human identities (email +
  * sub, optional groups) and SERVICE TOKENS — machine/API-key auth via the
  * `CF-Access-Client-Id`/`-Secret` headers — which carry `common_name` (the
  * token's client id) instead of email/sub. Single-tenant: every principal
  * belongs to the one configured org; admin comes from the email allowlist.
+ *
+ * A human is keyed by EMAIL, not by the Access `sub`. Cloudflare documents `sub`
+ * as unique to an email address per account but NOT durable: remove and re-add a
+ * user's seat and they come back with a different one, which would orphan every
+ * connection they own. The email is the identifier that survives that, and it is
+ * also the only one a delegating backend can know about a person (see
+ * `applyDelegatedSubject`), so keying on it is what lets a browser session and an
+ * agent acting for that same person reach the same rows.
  */
 export const principalFromAccessClaims = (
   claims: Record<string, unknown>,
@@ -39,7 +55,7 @@ export const principalFromAccessClaims = (
 
   return {
     kind: "member",
-    accountId: sub || email || commonName,
+    accountId: identityKey(email || sub || commonName),
     organizationId: config.organizationId,
     organizationName: config.organizationName,
     organizationSlug: config.organizationSlug,
@@ -76,6 +92,10 @@ export const readDelegatedIdentity = (request: Request): DelegatedIdentity => ({
  * is the token. Without this, a headless agent can only ever reach `owner: "org"`
  * rows, because its subject never matches any human's.
  *
+ * The subject a delegator sends is that person's EMAIL, the same key a browser
+ * session resolves to in `principalFromAccessClaims`. The two must agree or the
+ * delegated run silently sees organization rows only.
+ *
  * The gate, in order:
  *   - no delegation headers at all → the principal passes through untouched;
  *   - the caller is NOT the one configured delegator → `null`, i.e. REJECT the
@@ -103,7 +123,7 @@ export const applyDelegatedSubject = (
   const email = delegated.email?.trim() ?? "";
   if (subject.length === 0 && email.length === 0) return principal;
 
-  const delegator = config.accessDelegationCommonName ?? "";
+  const delegator = identityKey(config.accessDelegationCommonName ?? "");
   const mayDelegate =
     delegator.length > 0 && principal.email.length === 0 && principal.accountId === delegator;
   if (!mayDelegate) return null;
@@ -112,7 +132,7 @@ export const applyDelegatedSubject = (
   const isAdmin = email.length > 0 && config.adminEmails.includes(email.toLowerCase());
   return {
     ...principal,
-    accountId: subject,
+    accountId: identityKey(subject),
     email,
     name: email.length > 0 ? email : subject,
     roles: isAdmin ? ["admin"] : ["member"],

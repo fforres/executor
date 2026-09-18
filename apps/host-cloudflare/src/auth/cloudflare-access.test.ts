@@ -1,6 +1,7 @@
 import { describe, expect, it } from "@effect/vitest";
 
-import { orgWriteAccessForPrincipal } from "@executor-js/host-mcp";
+import { orgWriteAccessForPrincipal, principalOwns } from "@executor-js/host-mcp";
+import type { Principal } from "@executor-js/host-mcp";
 
 import type { CloudflareConfig } from "../config";
 import { applyDelegatedSubject, principalFromAccessClaims } from "./cloudflare-access";
@@ -21,12 +22,12 @@ const config: CloudflareConfig = {
 };
 
 describe("principalFromAccessClaims", () => {
-  it("maps a human identity (email + sub + groups)", () => {
+  it("maps a human identity (email + sub + groups), keyed on the EMAIL not the sub", () => {
     const p = principalFromAccessClaims(
       { sub: "user-123", email: "person@example.com", name: "Person", groups: ["eng"] },
       config,
     );
-    expect(p.accountId).toBe("user-123");
+    expect(p.accountId).toBe("person@example.com");
     expect(p.email).toBe("person@example.com");
     expect(p.name).toBe("Person");
     expect(p.roles).toEqual(["eng"]);
@@ -39,6 +40,26 @@ describe("principalFromAccessClaims", () => {
     expect(p.orgRoleModel).toBe("organization");
     expect(p.orgRole).toBe("admin");
     expect(orgWriteAccessForPrincipal(p)).toBe("allowed");
+  });
+
+  it("survives a seat being removed and re-added, which changes the Access sub", () => {
+    // Cloudflare documents `sub` as unique per email per account, but NOT durable:
+    // re-adding a user's seat mints a new one. Keying on it would orphan every
+    // connection that person owns.
+    const before = principalFromAccessClaims({ sub: "sub-1", email: "person@example.com" }, config);
+    const after = principalFromAccessClaims({ sub: "sub-2", email: "person@example.com" }, config);
+    expect(after.accountId).toBe(before.accountId);
+  });
+
+  it("is case-insensitive, so one person is never two accounts", () => {
+    const shouty = principalFromAccessClaims({ sub: "u", email: "Person@Example.com" }, config);
+    const quiet = principalFromAccessClaims({ sub: "u", email: "person@example.com" }, config);
+    expect(shouty.accountId).toBe(quiet.accountId);
+  });
+
+  it("falls back to the sub when a human identity carries no email", () => {
+    const p = principalFromAccessClaims({ sub: "user-123" }, config);
+    expect(p.accountId).toBe("user-123");
   });
 
   it("gives a SERVICE TOKEN (common_name, no email/sub) a stable identity", () => {
@@ -75,17 +96,17 @@ describe("applyDelegatedSubject", () => {
 
   it("re-binds the trusted delegator to the named subject", () => {
     const p = applyDelegatedSubject(delegatorPrincipal(), delegating, {
-      subject: "alice-access-sub",
+      subject: "alice@example.com",
       email: "alice@example.com",
     });
-    expect(p?.accountId).toBe("alice-access-sub");
+    expect(p?.accountId).toBe("alice@example.com");
     expect(p?.email).toBe("alice@example.com");
     expect(p?.roles).toEqual(["member"]);
   });
 
   it("mirrors the delegated human's admin standing", () => {
     const p = applyDelegatedSubject(delegatorPrincipal(), delegating, {
-      subject: "admin-access-sub",
+      subject: "ADMIN@example.com",
       email: "ADMIN@example.com",
     });
     expect(p?.roles).toContain("admin");
@@ -100,6 +121,21 @@ describe("applyDelegatedSubject", () => {
   it("REJECTS an admin human trying to delegate", () => {
     const admin = principalFromAccessClaims({ sub: "u", email: "admin@example.com" }, delegating);
     expect(applyDelegatedSubject(admin, delegating, { subject: "alice", email: null })).toBeNull();
+  });
+
+  it("reaches the SAME rows the person reaches in a browser", () => {
+    // The whole point of delegation: an agent acting for Alice and Alice's own
+    // session must resolve to one identity, or the agent silently sees org rows.
+    const browser = principalFromAccessClaims(
+      { sub: "alice-sub", email: "alice@example.com" },
+      delegating,
+    );
+    const delegated = applyDelegatedSubject(delegatorPrincipal(), delegating, {
+      subject: "Alice@Example.com",
+      email: "Alice@Example.com",
+    });
+    expect(delegated?.accountId).toBe(browser.accountId);
+    expect(principalOwns(browser, delegated as Principal)).toBe(true);
   });
 
   it("REJECTS a service token that is not the configured delegator", () => {
