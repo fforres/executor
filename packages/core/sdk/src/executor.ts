@@ -797,6 +797,16 @@ export interface ExecutorConfig<TPlugins extends readonly AnyPlugin[] = readonly
    */
   readonly toolsSyncGraceMs?: number | null;
   /**
+   * How long one instance's claim on a connection's OAuth refresh lasts. The
+   * claim is a row in the shared database, so it holds across isolates and
+   * replicas: a peer that needs the same connection waits for the holder's
+   * token instead of spending the same rotating refresh token, which
+   * authorization servers answer with invalid_grant and a revoked grant.
+   * Expiry is what lets a survivor take over from a holder that died
+   * mid-refresh. Defaults to 30 seconds.
+   */
+  readonly oauthRefreshLeaseMs?: number;
+  /**
    * Host keep-alive for background work that outlives a request — the
    * platform `waitUntil` on Cloudflare Workers, where I/O started inside a
    * request is cancelled once the response settles unless a host holds the
@@ -866,6 +876,21 @@ export const DEFAULT_TOOLS_SYNC_TTL_MS = 15 * 60 * 1000;
  *  `tools/list`) while keeping a read gated on a slow or dead server bounded
  *  well under any per-connection network timeout. */
 export const DEFAULT_TOOLS_SYNC_GRACE_MS = 2000;
+
+/** How long the stale scan leaves a connection alone after a tool sync STARTED
+ *  on it and never finished (its `tools_sync_started_at` is still set). An unfinished attempt is either still running on
+ *  another instance or died with its isolate (a catalog too large for the
+ *  isolate's memory dies the same way every time), so re-running it on every
+ *  read turns one oversized catalog into a crash loop that takes every read in
+ *  that isolate down with it. Past the window the scan tries again. */
+export const TOOLS_SYNC_ATTEMPT_BACKOFF_MS = 15 * 60 * 1000;
+
+/** Default `ExecutorConfig.oauthRefreshLeaseMs`. Covers one token request
+ *  (bounded by its own timeout) plus the persist that follows it. */
+export const DEFAULT_OAUTH_REFRESH_LEASE_MS = 30_000;
+
+/** How often an instance waiting on a peer's refresh lease re-reads the row. */
+const OAUTH_REFRESH_LEASE_POLL_MS = 100;
 
 /** How many stale connection catalogs are DISCOVERED at once on a tools read.
  *  Bounded so a host with a large stale set cannot open an unbounded number of
@@ -2346,6 +2371,12 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
      *  contention this path spends retries fighting. Skip it when the value
      *  has not changed; a rotated token never matches, so the write that
      *  actually matters is never skipped. */
+    // OAuth is always single-input: the access token lives in the `token`
+    // item. Falls back to a deterministic id if the map is somehow empty.
+    const accessTokenItemIdOf = (row: ConnectionRow): string =>
+      connectionItemIds(row)[PRIMARY_INPUT_VARIABLE] ??
+      `connection:${row.owner}:${row.integration}:${row.name}:${PRIMARY_INPUT_VARIABLE}`;
+
     const persistRefreshedToken = (
       row: ConnectionRow,
       provider: CredentialProvider,
@@ -2354,11 +2385,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
     ): Effect.Effect<void, StorageFailure> =>
       Effect.gen(function* () {
         if (provider.set) {
-          // OAuth is always single-input: the access token lives in the `token`
-          // item. Fall back to a deterministic id if the map is somehow empty.
-          const tokenItemId =
-            connectionItemIds(row)[PRIMARY_INPUT_VARIABLE] ??
-            `connection:${row.owner}:${row.integration}:${row.name}:${PRIMARY_INPUT_VARIABLE}`;
+          const tokenItemId = accessTokenItemIdOf(row);
           if (
             token.refresh_token &&
             row.refresh_item_id &&
@@ -2373,6 +2400,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           typeof token.expires_in === "number" ? Date.now() + token.expires_in * 1000 : null;
         const set: Record<string, unknown> = {
           expires_at: nextExpiresAt,
+          oauth_refreshed_at: Date.now(),
           updated_at: new Date(),
         };
         if (token.scope !== undefined) set.oauth_scope = token.scope;
@@ -2935,6 +2963,105 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         }),
       );
 
+    const refreshLeaseMs = config.oauthRefreshLeaseMs ?? DEFAULT_OAUTH_REFRESH_LEASE_MS;
+
+    const connectionRefOf = (row: ConnectionRow): ConnectionRef => ({
+      owner: row.owner as Owner,
+      integration: IntegrationSlug.make(row.integration),
+      name: ConnectionName.make(row.name),
+    });
+
+    const connectionRowWhere = (row: ConnectionRow) => (b: AnyCb) =>
+      b.and(
+        byOwner(row.owner as Owner)(b),
+        b("integration", "=", String(row.integration)),
+        b("name", "=", String(row.name)),
+      );
+
+    const refreshedAtOf = (row: ConnectionRow): number | null =>
+      row.oauth_refreshed_at == null ? null : Number(row.oauth_refreshed_at);
+
+    const releaseRefreshLease = (row: ConnectionRow, holder: string) =>
+      core
+        .updateMany("connection", {
+          where: (b: AnyCb) =>
+            b.and(connectionRowWhere(row)(b), b("refresh_lease_holder", "=", holder)),
+          set: { refresh_lease_until: null, refresh_lease_holder: null },
+        })
+        .pipe(Effect.ignore);
+
+    const pollDelay = Effect.promise(
+      () => new Promise<void>((resolve) => setTimeout(resolve, OAUTH_REFRESH_LEASE_POLL_MS)),
+    );
+
+    /** The cross-instance layer of refresh single-flight. The in-isolate gate
+     *  (`refreshInFlight`) only dedupes callers sharing one root DB handle; on
+     *  Cloudflare every MCP session is its own Durable Object, so two sessions
+     *  would otherwise spend the same rotating refresh token and the
+     *  authorization server would revoke the grant ("refresh token reuse").
+     *
+     *  Claim: a conditional UPDATE that only lands on a free or lapsed lease,
+     *  stamping an id unique to this attempt; reading the row back says who
+     *  won (the facade's `updateMany` reports no row count). A loser never
+     *  sends a grant: it polls until the holder's persist shows up as a newer
+     *  `oauth_refreshed_at` than the row it started from and returns that
+     *  stored access token, or until the lease lapses (a holder that died) and
+     *  it can claim. The same comparison runs right after a win, so a caller
+     *  holding a row read before a peer's refresh finished uses the peer's
+     *  token rather than spending the successor refresh token for nothing. */
+    const leasedTokenRefresh = (
+      seen: ConnectionRow,
+      provider: CredentialProvider,
+      trigger: RefreshTrigger,
+    ): Effect.Effect<string | null, StorageFailure | CredentialResolutionError> => {
+      const holder = crypto.randomUUID();
+      const giveUpAt = Date.now() + refreshLeaseMs + refreshLeaseMs;
+      const attempt = (): Effect.Effect<
+        string | null,
+        StorageFailure | CredentialResolutionError
+      > =>
+        Effect.gen(function* () {
+          const now = Date.now();
+          yield* core.updateMany("connection", {
+            where: (b: AnyCb) =>
+              b.and(
+                connectionRowWhere(seen)(b),
+                b.or(b.isNull("refresh_lease_until"), b("refresh_lease_until", "<=", now)),
+              ),
+            set: { refresh_lease_until: now + refreshLeaseMs, refresh_lease_holder: holder },
+          });
+          const fresh = yield* findConnectionRow(connectionRefOf(seen));
+          if (fresh === null) return yield* performTokenRefresh(seen, provider, trigger);
+          const won = fresh.refresh_lease_holder === holder;
+
+          const peerStamp = refreshedAtOf(fresh);
+          if (peerStamp !== null && peerStamp !== refreshedAtOf(seen)) {
+            const access = yield* provider.get(ProviderItemId.make(accessTokenItemIdOf(fresh)));
+            if (access !== null) {
+              if (won) yield* releaseRefreshLease(seen, holder);
+              yield* Effect.annotateCurrentSpan({ "executor.oauth.refresh.joined_peer": true });
+              return access;
+            }
+          }
+
+          if (won) {
+            return yield* performTokenRefresh(fresh, provider, trigger).pipe(
+              Effect.ensuring(releaseRefreshLease(seen, holder)),
+            );
+          }
+
+          if (Date.now() >= giveUpAt) {
+            return yield* new StorageError({
+              message: `Timed out waiting for another instance to refresh the OAuth token for ${seen.owner}/${seen.integration}/${seen.name}; retry the call.`,
+              cause: undefined,
+            });
+          }
+          yield* pollDelay;
+          return yield* attempt();
+        });
+      return attempt();
+    };
+
     const refreshConnectionToken = (
       row: ConnectionRow,
       provider: CredentialProvider,
@@ -2975,7 +3102,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         // Nothing suspends between the lookup above and this registration, so
         // check-and-set is atomic against peer fibers and cannot double-fire.
         refreshInFlight.set(key, deferred);
-        const run = performTokenRefresh(row, provider, trigger).pipe(
+        const run = leasedTokenRefresh(row, provider, trigger).pipe(
           Effect.exit,
           Effect.flatMap((exit) => Deferred.done(deferred, exit)),
           Effect.ensuring(Effect.sync(() => void refreshInFlight.delete(key))),
@@ -3543,10 +3670,11 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           return isToolSyncHealth(health)
             ? {
                 tools_synced_at: Date.now(),
+                tools_sync_started_at: null,
                 last_health: null,
                 updated_at: new Date(),
               }
-            : { tools_synced_at: Date.now() };
+            : { tools_synced_at: Date.now(), tools_sync_started_at: null };
         };
         // Every exit stamps the sync time — including the cleanup paths that
         // produce zero tools — so the stale-catalog check (`config_revised_at`
@@ -3597,7 +3725,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
                         ),
                       set:
                         oauthReauthRequiredFromProviderState(fresh.provider_state) !== null
-                          ? { tools_synced_at: Date.now() }
+                          ? { tools_synced_at: Date.now(), tools_sync_started_at: null }
                           : {
                               tools_synced_at: Date.now(),
                               // A plugin-supplied verdict (e.g. the MCP server
@@ -3605,6 +3733,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
                               // sync-stamped: mark it so credential-only health
                               // checks cannot bury it under "healthy", and a
                               // later successful sync clears it.
+                              tools_sync_started_at: null,
                               last_health:
                                 health === undefined
                                   ? toolSyncHealth(reason)
@@ -3652,6 +3781,15 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           );
           return [];
         }
+
+        // Stamped before the heavy work and committed on its own, so an
+        // isolate that dies inside `resolveTools` or the persist below leaves
+        // evidence the stale scan can back off on (see
+        // `TOOLS_SYNC_ATTEMPT_BACKOFF_MS`).
+        yield* core.updateMany("connection", {
+          where: connectionWhere,
+          set: { tools_sync_started_at: Date.now() },
+        });
 
         const result: ResolveToolsResult = yield* runtime.plugin
           .resolveTools({
@@ -5630,6 +5768,21 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
             syncedAt !== null &&
             syncedAt < cutoff;
           if (!staleMarked && !configRevised && !expired) continue;
+
+          const startedAt =
+            connection.tools_sync_started_at == null
+              ? null
+              : Number(connection.tools_sync_started_at);
+          // Every finished attempt clears the start stamp, so a stamp still set
+          // is an attempt that never reached the end.
+          if (startedAt !== null && Date.now() - startedAt < TOOLS_SYNC_ATTEMPT_BACKOFF_MS) {
+            yield* Effect.logWarning("executor stale tool sync skipped: previous attempt unfinished", {
+              integration: connection.integration,
+              connection: connection.name,
+              startedAt,
+            });
+            continue;
+          }
 
           (staleMarked || configRevised || mode === "converge" ? urgent : deferred).push(
             produceConnectionTools(

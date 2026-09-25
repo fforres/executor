@@ -1585,6 +1585,10 @@ describe("oauth token refresh in resolveConnectionValue", () => {
           // second would simply join the first's grant — closing the very
           // window this test exists to open. A second replica holds a second
           // handle, which is what the extra `withQueryContext` wrapper is.
+          //
+          // The cross-instance refresh lease would make B wait for A; a short
+          // lease is A stalling past it, so B takes over and the window stays
+          // open.
           const config = {
             ...makeTestConfig({
               plugins: [oauthPlugin] as const,
@@ -1592,6 +1596,7 @@ describe("oauth token refresh in resolveConnectionValue", () => {
               subject: SHARED_STORE_SUBJECT,
             }),
             providers: [sharedStore],
+            oauthRefreshLeaseMs: 200,
           };
           const instanceA = yield* createExecutor(config);
           const instanceB = yield* createExecutor({
@@ -2956,6 +2961,172 @@ describe("resource-less client sends no resource parameter (#1789)", () => {
           (r) => r.path === "/token" && r.body.includes("grant_type=client_credentials"),
         );
         expect(grant?.body).toContain(`resource=${encodeURIComponent(server.mcpResourceUrl)}`);
+      }),
+    ),
+  );
+});
+
+// Two instances (two isolates, two replicas) over ONE database and ONE
+// credential store, which is what a Cloudflare deployment is: every MCP
+// session is its own Durable Object. The in-isolate refresh gate cannot see
+// across them, so only a lease in the shared database keeps both from spending
+// the same rotating refresh token.
+describe("oauth refresh across instances", () => {
+  const twoInstancesOverOneExpiredConnection = (options: {
+    readonly oauthRefreshLeaseMs?: number;
+  }) =>
+    Effect.gen(function* () {
+      const server = yield* serveOAuthTestServer({ scopes: ["read"] });
+      const store = new Map<string, string>();
+      const pause = {
+        next: false,
+        reached: yield* Deferred.make<void>(),
+        resume: yield* Deferred.make<void>(),
+      };
+      const sharedStore: CredentialProvider = {
+        key: ProviderKey.make("shared-memory"),
+        writable: true,
+        get: (id) =>
+          Effect.gen(function* () {
+            const value = store.get(String(id)) ?? null;
+            if (pause.next && String(id).endsWith(":refresh")) {
+              pause.next = false;
+              yield* Deferred.succeed(pause.reached, undefined);
+              yield* Deferred.await(pause.resume);
+            }
+            return value;
+          }),
+        set: (id, value) => Effect.sync(() => void store.set(String(id), value)),
+        delete: (id) => Effect.sync(() => void store.delete(String(id))),
+      };
+      const config = {
+        ...makeTestConfig({
+          plugins: [oauthPlugin] as const,
+          tenant: SHARED_STORE_TENANT,
+          subject: SHARED_STORE_SUBJECT,
+        }),
+        providers: [sharedStore],
+        ...(options.oauthRefreshLeaseMs === undefined
+          ? {}
+          : { oauthRefreshLeaseMs: options.oauthRefreshLeaseMs }),
+      };
+      const instanceA = yield* createExecutor(config);
+      const instanceB = yield* createExecutor({
+        ...config,
+        db: withQueryContext(config.testDb.db, {
+          tenant: SHARED_STORE_TENANT,
+          subject: SHARED_STORE_SUBJECT,
+        }),
+      });
+      yield* Effect.addFinalizer(() =>
+        Effect.promise(() => config.testDb.close()).pipe(Effect.ignore),
+      );
+      yield* Effect.addFinalizer(() => instanceA.close().pipe(Effect.ignore));
+      yield* Effect.addFinalizer(() => instanceB.close().pipe(Effect.ignore));
+
+      yield* instanceA.acme.seed();
+      yield* instanceA.oauth.createClient({
+        owner: "org",
+        slug: CLIENT,
+        authorizationUrl: server.authorizationEndpoint,
+        tokenUrl: server.tokenEndpoint,
+        grant: "authorization_code",
+        clientId: "test-client",
+        clientSecret: "test-secret",
+      });
+      const started = yield* instanceA.oauth.start({
+        owner: "org",
+        client: CLIENT,
+        clientOwner: "org",
+        name: ConnectionName.make("main"),
+        integration: INTEG,
+        template: TEMPLATE,
+      });
+      if (started.status !== "redirect") {
+        return yield* Effect.die("expected an authorization redirect");
+      }
+      const callback = yield* server.completeAuthorizationCodeFlow({
+        authorizationUrl: started.authorizationUrl,
+      });
+      yield* instanceA.oauth.complete({ state: started.state, code: callback.code });
+      yield* Effect.promise(() =>
+        config.db.updateMany("connection", {
+          where: (b) => b("name", "=", "main"),
+          set: { expires_at: Date.now() - 60_000 },
+        }),
+      );
+
+      const refreshGrants = server.requests.pipe(
+        Effect.map(
+          (requests) =>
+            requests.filter(
+              (request) =>
+                request.path === "/token" && request.body.includes("grant_type=refresh_token"),
+            ).length,
+        ),
+      );
+      return { server, config, instanceA, instanceB, pause, refreshGrants };
+    });
+
+  const whoami = ToolAddress.make("tools.acme.org.main.whoami");
+
+  const realSleep = (ms: number) =>
+    Effect.promise(() => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+
+  it.effect(
+    "two instances refreshing one connection at once send one refresh grant and both get a working token",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const { server, instanceA, instanceB, pause, refreshGrants } =
+            yield* twoInstancesOverOneExpiredConnection({});
+
+          // A is mid-refresh: it has the stored refresh token in hand and has
+          // not yet spent it.
+          pause.next = true;
+          const refresherA = yield* Effect.forkChild(instanceA.execute(whoami, {}));
+          yield* Deferred.await(pause.reached);
+
+          // B needs a token too, right now. Given the time, it would spend the
+          // same refresh token A is holding.
+          const refresherB = yield* Effect.forkChild(instanceB.execute(whoami, {}));
+          yield* realSleep(300);
+
+          yield* Deferred.succeed(pause.resume, undefined);
+          const resultA = (yield* Fiber.join(refresherA)) as { token: string };
+          const resultB = (yield* Fiber.join(refresherB)) as { token: string };
+
+          expect(yield* refreshGrants, "only one instance spent the refresh token").toBe(1);
+          expect(yield* server.acceptsAccessToken(resultA.token), "A's token works").toBe(true);
+          expect(yield* server.acceptsAccessToken(resultB.token), "B's token works").toBe(true);
+        }),
+      ),
+  );
+
+  it.effect("a lease left by an instance that died mid-refresh is taken over once it lapses", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { server, config, instanceA, refreshGrants } =
+          yield* twoInstancesOverOneExpiredConnection({});
+
+        yield* Effect.promise(() =>
+          config.db.updateMany("connection", {
+            where: (b) => b("name", "=", "main"),
+            set: {
+              refresh_lease_until: Date.now() + 400,
+              refresh_lease_holder: "an-isolate-that-died",
+            },
+          }),
+        );
+
+        const result = (yield* instanceA.execute(whoami, {})) as { token: string };
+
+        expect(yield* refreshGrants, "the survivor refreshed once the lease lapsed").toBe(1);
+        expect(yield* server.acceptsAccessToken(result.token)).toBe(true);
+        const row = yield* Effect.promise(() =>
+          config.db.findFirst("connection", { where: (b) => b("name", "=", "main") }),
+        );
+        expect(row?.refresh_lease_holder, "the survivor released its own lease").toBeNull();
       }),
     ),
   );

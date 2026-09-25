@@ -2043,6 +2043,78 @@ describe("tool catalog sync safety", () => {
   );
 
   it.effect(
+    "a sync that started and never finished is not retried on every read until its backoff passes",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          let resolutions = 0;
+          const guardedPlugin = definePlugin(() => ({
+            id: "guarded" as const,
+            credentialProviders: [memoryProvider()],
+            storage: () => ({}),
+            resolveTools: () =>
+              Effect.sync(() => {
+                resolutions += 1;
+                return {
+                  tools: [{ name: ToolName.make("deploy"), description: "deploy" }],
+                };
+              }),
+            invokeTool: ({ toolRow }) => Effect.succeed({ ran: toolRow.name }),
+            extension: (ctx) => ({
+              seed: () =>
+                ctx.core.integrations.register({
+                  slug: INTEG,
+                  description: "Vercel",
+                  config: {},
+                }),
+            }),
+          }))();
+          const config = makeTestConfig({ plugins: [guardedPlugin] as const });
+          const executor = yield* createExecutor({ ...config, toolsSyncGraceMs: null });
+          yield* executor.guarded.seed();
+          yield* executor.connections.create({
+            owner: "org",
+            name: ConnectionName.make("main"),
+            integration: INTEG,
+            template: TEMPLATE,
+            value: "secret-token",
+          });
+          const resolutionsAfterCreate = resolutions;
+
+          // A sync began and the isolate running it died before it finished:
+          // the start is stamped, the finish never was.
+          yield* Effect.promise(() =>
+            config.db.updateMany("connection", {
+              where: (b) => b.and(b("integration", "=", String(INTEG)), b("name", "=", "main")),
+              set: { tools_synced_at: null, tools_sync_started_at: Date.now() },
+            }),
+          );
+
+          const firstRead = yield* executor.tools.list({ integration: INTEG });
+          yield* executor.tools.list({ integration: INTEG });
+          expect(resolutions, "reads inside the backoff do not re-run the crashed sync").toBe(
+            resolutionsAfterCreate,
+          );
+          expect(
+            firstRead.map((tool) => String(tool.name)),
+            "reads inside the backoff serve the existing catalog",
+          ).toEqual(["deploy"]);
+
+          yield* Effect.promise(() =>
+            config.db.updateMany("connection", {
+              where: (b) => b.and(b("integration", "=", String(INTEG)), b("name", "=", "main")),
+              set: { tools_sync_started_at: Date.now() - 16 * 60_000 },
+            }),
+          );
+          yield* executor.tools.list({ integration: INTEG });
+          expect(resolutions, "a read after the backoff retries the sync once").toBe(
+            resolutionsAfterCreate + 1,
+          );
+        }),
+      ),
+  );
+
+  it.effect(
     "background sync preserves a nonzero remote catalog when a plugin returns authoritative empty",
     () =>
       Effect.scoped(

@@ -227,6 +227,12 @@ export const coreTables = defineTables({
       // Epoch ms of the last tool (re)production for this connection. Stale
       // vs the integration's `config_revised_at` → re-produced on next read.
       tools_synced_at: nullableBigintColumn("tools_synced_at"),
+      // Epoch ms the current tool (re)production STARTED; cleared when it
+      // finishes. Still set means an attempt has not finished: running
+      // elsewhere, or its isolate died mid-rebuild. The stale scan backs off
+      // such a connection instead of re-running the same rebuild on every
+      // read.
+      tools_sync_started_at: nullableBigintColumn("tools_sync_started_at"),
       oauth_client: nullableTextColumn("oauth_client"),
       // The OWNER of `oauth_client` (a Personal connection may be minted through
       // a shared Workspace app), set together with `oauth_client`; null for
@@ -235,6 +241,16 @@ export const coreTables = defineTables({
       oauth_client_owner: nullableTextColumn("oauth_client_owner"),
       refresh_item_id: nullableTextColumn("refresh_item_id"),
       expires_at: nullableBigintColumn("expires_at"),
+      // Cross-instance refresh lease. A refresher claims it with a
+      // conditional UPDATE before spending the rotating refresh token, so two
+      // isolates never send the same one. Epoch ms the claim lapses (covering
+      // a holder that dies mid-refresh) and the claimant's opaque id.
+      refresh_lease_until: nullableBigintColumn("refresh_lease_until"),
+      refresh_lease_holder: nullableTextColumn("refresh_lease_holder"),
+      // Epoch ms of the last persisted token refresh. A refresher that waited
+      // on a peer's lease compares it with the row it started from to tell
+      // whether the peer already minted a token it can use.
+      oauth_refreshed_at: nullableBigintColumn("oauth_refreshed_at"),
       oauth_scope: nullableTextColumn("oauth_scope"),
       // Per-connection token endpoint override. Set only when the code was
       // redeemed at a region other than the oauth_client's configured token host
