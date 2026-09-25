@@ -65,6 +65,12 @@ export interface OAuthTestServerOptions {
   readonly scopes?: readonly string[];
   readonly omitTokenResponseScopes?: readonly string[];
   readonly supportRefresh?: boolean;
+  /** Treat a spent refresh token presented again as theft, as providers that
+   *  enforce strict rotation do: the reuse answers `invalid_grant` and revokes
+   *  every live refresh and access token of that grant, so the connection is
+   *  dead until the user signs in again. Without it a spent token is merely
+   *  unknown and its successor stays valid. */
+  readonly revokeGrantOnReuse?: boolean;
   readonly tokenExpiresInSeconds?: number;
   /** Refuse a refresh-token grant whose `scope` parameter names anything outside
    *  this list, answering the RFC 6749 §5.2 envelope Railway returns:
@@ -211,6 +217,9 @@ interface RefreshTokenRecord {
   readonly username: string;
   readonly scope: string | null;
   readonly resource: string | null;
+  /** Every token minted from one authorization shares it, so a detected reuse
+   *  can revoke the whole grant. */
+  readonly grantId: string;
 }
 
 const JsonObject = Schema.Record(Schema.String, Schema.Unknown);
@@ -570,6 +579,13 @@ export const serveOAuthTestServer = (
     const transactions = new Map<string, AuthorizationTransaction>();
     const authorizationCodes = new Map<string, AuthorizationCodeRecord>();
     const refreshTokens = new Map<string, RefreshTokenRecord>();
+    const spentRefreshTokens = new Map<string, string>();
+    const accessTokensByGrant = new Map<string, Set<string>>();
+    const recordGrantAccessToken = (grantId: string, accessToken: string) => {
+      const tokens = accessTokensByGrant.get(grantId) ?? new Set<string>();
+      tokens.add(accessToken);
+      accessTokensByGrant.set(grantId, tokens);
+    };
     const defaultClientId = options.defaultClientId ?? "test-client";
     const defaultClientSecret = options.defaultClientSecret ?? "test-secret";
 
@@ -827,11 +843,14 @@ export const serveOAuthTestServer = (
             const accessToken = `at_${randomUUID()}`;
             const refreshToken = `rt_${randomUUID()}`;
             yield* Ref.update(issuedAccessTokens, (tokens) => new Set([...tokens, accessToken]));
+            const grantId = randomUUID();
+            recordGrantAccessToken(grantId, accessToken);
             refreshTokens.set(refreshToken, {
               clientId,
               username: record.username,
               scope: record.scope,
               resource: record.resource,
+              grantId,
             });
             const scope = tokenResponseScope(record.scope);
             return jsonResponse(
@@ -851,6 +870,21 @@ export const serveOAuthTestServer = (
           if (grantType === "refresh_token") {
             const refreshToken = params.get("refresh_token");
             const record = refreshToken ? refreshTokens.get(refreshToken) : undefined;
+            const reusedGrantId =
+              options.revokeGrantOnReuse === true && refreshToken
+                ? spentRefreshTokens.get(refreshToken)
+                : undefined;
+            if (reusedGrantId !== undefined) {
+              for (const [token, live] of [...refreshTokens]) {
+                if (live.grantId === reusedGrantId) refreshTokens.delete(token);
+              }
+              const revoked = accessTokensByGrant.get(reusedGrantId) ?? new Set<string>();
+              yield* Ref.update(
+                issuedAccessTokens,
+                (tokens) => new Set([...tokens].filter((token) => !revoked.has(token))),
+              );
+              return oauthError(400, "invalid_grant", "Refresh token reuse detected");
+            }
             if (!supportRefresh || !refreshToken || !record || record.clientId !== clientId) {
               const rejection = options.refreshRejection;
               return rejection
@@ -874,7 +908,9 @@ export const serveOAuthTestServer = (
             const nextAccessToken = `at_${randomUUID()}`;
             const nextRefreshToken = `rt_${randomUUID()}`;
             refreshTokens.delete(refreshToken);
+            spentRefreshTokens.set(refreshToken, record.grantId);
             refreshTokens.set(nextRefreshToken, record);
+            recordGrantAccessToken(record.grantId, nextAccessToken);
             yield* Ref.update(
               issuedAccessTokens,
               (tokens) => new Set([...tokens, nextAccessToken]),

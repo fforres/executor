@@ -209,6 +209,7 @@ import {
   refreshAccessToken,
   exchangeClientCredentials,
   isPermanentTokenRejection,
+  OAUTH2_DEFAULT_TIMEOUT_MS,
   isUnusableSuccessTokenResponse,
   optionalScopesFromAuthorizationUrl,
   shouldRefreshToken,
@@ -891,6 +892,31 @@ export const DEFAULT_OAUTH_REFRESH_LEASE_MS = 30_000;
 
 /** How often an instance waiting on a peer's refresh lease re-reads the row. */
 const OAUTH_REFRESH_LEASE_POLL_MS = 100;
+
+/** Upper bound of the safety margin inside a refresh lease (a sixth of the
+ *  lease when that is smaller). A holder only sends its grant with at least
+ *  twice the margin left, bounds the grant to end one margin before the lease
+ *  does, and a waiter only takes a lapsed lease over one margin after it
+ *  lapsed. The margin absorbs clock skew between instances and a provider
+ *  still processing a request its client already abandoned. */
+const OAUTH_REFRESH_LEASE_MARGIN_MS = 5_000;
+
+/** What a leased refresh returns when it found, before sending anything, that
+ *  it no longer holds the lease or has too little of it left to finish. The
+ *  caller re-enters the lease loop: it joins the peer's token or claims again. */
+const REFRESH_LEASE_LOST = Symbol("refresh-lease-lost");
+type RefreshLeaseLost = typeof REFRESH_LEASE_LOST;
+
+/** One claimed refresh lease. `leaseUntil` moves forward when the holder
+ *  renews after a successful grant; `startStamp` is the connection's
+ *  `oauth_refreshed_at` when the claim landed, so any later value is a peer's
+ *  committed refresh. */
+interface RefreshLease {
+  readonly holder: string;
+  leaseUntil: number;
+  readonly startStamp: number | null;
+  readonly tookOverLapsedLease: boolean;
+}
 
 /** How many stale connection catalogs are DISCOVERED at once on a tools read.
  *  Bounded so a host with a large stale set cannot open an unbounded number of
@@ -2309,6 +2335,10 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
       // grant too, but stamping it `credential_refresh_rejected` would bury
       // the one classification that says "reconnecting cannot help".
       reason: HealthCheckReason,
+      // The `oauth_refreshed_at` the rejected grant started from. When given,
+      // the verdict only lands if no refresh committed since, so a late loser
+      // cannot bury a peer's success under a dead-grant record.
+      expectedRefreshedAt?: number | null,
     ): Effect.Effect<void, never> => {
       const existingState = decodeJsonColumn(row.provider_state);
       const mergedState =
@@ -2328,6 +2358,11 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
               byOwner(row.owner as Owner)(b),
               b("integration", "=", String(row.integration)),
               b("name", "=", String(row.name)),
+              expectedRefreshedAt === undefined
+                ? true
+                : expectedRefreshedAt === null
+                  ? b.isNull("oauth_refreshed_at")
+                  : b("oauth_refreshed_at", "=", expectedRefreshedAt),
             ),
           set: {
             provider_state: {
@@ -2586,12 +2621,126 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         } satisfies OAuth2TokenResponse;
       });
 
+    const refreshLeaseMs = config.oauthRefreshLeaseMs ?? DEFAULT_OAUTH_REFRESH_LEASE_MS;
+
+    const connectionRefOf = (row: ConnectionRow): ConnectionRef => ({
+      owner: row.owner as Owner,
+      integration: IntegrationSlug.make(row.integration),
+      name: ConnectionName.make(row.name),
+    });
+
+    const connectionRowWhere = (row: ConnectionRow) => (b: AnyCb) =>
+      b.and(
+        byOwner(row.owner as Owner)(b),
+        b("integration", "=", String(row.integration)),
+        b("name", "=", String(row.name)),
+      );
+
+    const refreshedAtOf = (row: ConnectionRow): number | null =>
+      row.oauth_refreshed_at == null ? null : Number(row.oauth_refreshed_at);
+
+    const refreshLeaseMarginMs = Math.min(
+      OAUTH_REFRESH_LEASE_MARGIN_MS,
+      Math.floor(refreshLeaseMs / 6),
+    );
+
+    const pollDelay = Effect.promise(
+      () => new Promise<void>((resolve) => setTimeout(resolve, OAUTH_REFRESH_LEASE_POLL_MS)),
+    );
+
+    /** How long the grant may take, or null when this holder must not send it:
+     *  the lease is no longer ours, a peer already committed a refresh, or too
+     *  little of the lease is left to finish before a waiter may take over. */
+    const remainingGrantBudget = (
+      row: ConnectionRow,
+      lease: RefreshLease,
+    ): Effect.Effect<number | null, StorageFailure> =>
+      Effect.gen(function* () {
+        const current = yield* findConnectionRow(connectionRefOf(row));
+        if (current === null || current.refresh_lease_holder !== lease.holder) return null;
+        if (refreshedAtOf(current) !== lease.startStamp) return null;
+        const budget = lease.leaseUntil - refreshLeaseMarginMs - Date.now();
+        return budget >= refreshLeaseMarginMs ? budget : null;
+      });
+
+    /** After a successful grant and before persisting it: renew the lease so a
+     *  slow persist cannot let a waiter take over while the spent refresh token
+     *  is still the stored one, then look for a peer that committed first. A
+     *  peer can only have done so against a provider that tolerates reuse; its
+     *  token is then the stored one and ours is dropped. Otherwise our token is
+     *  the grant's valid successor and is persisted even if the renewal did not
+     *  land. Returns the peer's access token, or null to persist ours. */
+    const settleLeasedGrant = (
+      row: ConnectionRow,
+      provider: CredentialProvider,
+      lease: RefreshLease,
+    ): Effect.Effect<string | null, StorageFailure> =>
+      Effect.gen(function* () {
+        const renewedUntil = Date.now() + refreshLeaseMs;
+        yield* core.updateMany("connection", {
+          where: (b: AnyCb) =>
+            b.and(connectionRowWhere(row)(b), b("refresh_lease_holder", "=", lease.holder)),
+          set: { refresh_lease_until: renewedUntil },
+        });
+        const current = yield* findConnectionRow(connectionRefOf(row));
+        if (current?.refresh_lease_holder === lease.holder) lease.leaseUntil = renewedUntil;
+        if (current === null || refreshedAtOf(current) === lease.startStamp) return null;
+        const access = yield* provider.get(ProviderItemId.make(accessTokenItemIdOf(current)));
+        if (access !== null) {
+          yield* Effect.annotateCurrentSpan({
+            "executor.oauth.refresh.peer_committed_first": true,
+          });
+        }
+        return access;
+      });
+
+    /** Decide what an invalid_grant on our refresh grant means before calling
+     *  the connection dead. A peer that spent the same refresh token first left
+     *  a newer `oauth_refreshed_at` (use its access token) or at least a
+     *  different stored refresh token (its persist is still landing: wait for
+     *  it). A holder that took over a lapsed lease also waits, for a stalled
+     *  holder's late commit. Returns the peer's access token, `"pending"` when a
+     *  newer refresh token is stored but never got its access token in time,
+     *  or null when nothing supersedes the rejection. */
+    const findSupersedingRefresh = (
+      row: ConnectionRow,
+      provider: CredentialProvider,
+      sentRefreshToken: string,
+      startStamp: number | null,
+      waitForLateCommit: boolean,
+    ): Effect.Effect<string | "pending" | null, StorageFailure> => {
+      const deadline = Date.now() + refreshLeaseMs;
+      const look = (): Effect.Effect<string | "pending" | null, StorageFailure> =>
+        Effect.gen(function* () {
+          const current = yield* findConnectionRow(connectionRefOf(row));
+          if (current === null) return null;
+          if (refreshedAtOf(current) !== startStamp) {
+            const access = yield* provider.get(ProviderItemId.make(accessTokenItemIdOf(current)));
+            if (access !== null) return access;
+          }
+          const storedRefreshToken = current.refresh_item_id
+            ? yield* provider.get(ProviderItemId.make(current.refresh_item_id))
+            : null;
+          const peerRotated =
+            storedRefreshToken !== null && storedRefreshToken !== sentRefreshToken;
+          if (!peerRotated && !waitForLateCommit) return null;
+          if (Date.now() >= deadline) return peerRotated ? "pending" : null;
+          yield* pollDelay;
+          return yield* look();
+        });
+      return look();
+    };
+
     // Perform the actual refresh-token grant and persist the rotated material.
     const performTokenRefresh = (
       row: ConnectionRow,
       provider: CredentialProvider,
       trigger: RefreshTrigger,
-    ): Effect.Effect<string | null, StorageFailure | CredentialResolutionError> =>
+      lease?: RefreshLease,
+    ): Effect.Effect<
+      string | null | RefreshLeaseLost,
+      StorageFailure | CredentialResolutionError
+    > =>
       Effect.gen(function* () {
         const owner = row.owner as Owner;
         const reauth = (
@@ -2826,6 +2975,17 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
                   );
                 }
                 storedRefreshToken = refreshToken;
+                // Last check before the single-use token goes on the wire: a
+                // holder that stalled past its lease (or would run past it)
+                // must not send, because a waiter may already have taken over
+                // and spent the same token, and a provider that enforces
+                // rotation revokes the whole grant on the second use.
+                const grantBudget =
+                  lease === undefined ? null : yield* remainingGrantBudget(row, lease);
+                if (lease !== undefined && grantBudget === null) {
+                  yield* Effect.annotateCurrentSpan({ "executor.oauth.refresh.lease_lost": true });
+                  return REFRESH_LEASE_LOST;
+                }
                 return yield* refreshAccessToken({
                   tokenUrl,
                   clientId: clientRow.clientId,
@@ -2839,6 +2999,11 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
                   requestFormat: clientRow.tokenRequestFormat,
                   endpointUrlPolicy: config.oauthEndpointUrlPolicy,
                   fetch: config.fetch,
+                  // Bounded to end before the lease does, so an aborted
+                  // request is the worst a slow provider can cause.
+                  ...(grantBudget === null
+                    ? {}
+                    : { timeoutMs: Math.min(OAUTH2_DEFAULT_TIMEOUT_MS, grantBudget) }),
                 }).pipe(
                   Effect.mapError((cause) => {
                     // An RFC 6749 §5.2 error code is the AS's definitive
@@ -2894,19 +3059,57 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
                       cause,
                     });
                   }),
-                  // Persist the definitive verdict so the NEXT refresh skips
-                  // the doomed grant (see the known-dead gate above) and the
-                  // connection shows `expired` without waiting for a probe.
-                  Effect.tapError((error) =>
+                  // A rejection is only the grant's death when nothing newer
+                  // superseded it: a peer that spent the same token first
+                  // left its own token behind, and that is what the caller
+                  // gets. Otherwise persist the definitive verdict so the NEXT
+                  // refresh skips the doomed grant (see the known-dead gate
+                  // above) and the connection shows `expired` without waiting
+                  // for a probe.
+                  Effect.catch((error) =>
                     Predicate.isTagged(error, "CredentialResolutionError") &&
                     error.reauthRequired === true
-                      ? // oxlint-disable-next-line executor/no-unknown-error-message -- boundary: CredentialResolutionError carries a typed `message` field
-                        markRefreshGrantDead(row, error.message, credentialFailureReason(error))
-                      : Effect.void,
+                      ? Effect.gen(function* () {
+                          const startStamp = lease?.startStamp ?? refreshedAtOf(row);
+                          const superseding = yield* findSupersedingRefresh(
+                            row,
+                            provider,
+                            refreshToken,
+                            startStamp,
+                            lease?.tookOverLapsedLease === true,
+                          );
+                          if (superseding !== null && superseding !== "pending") {
+                            yield* Effect.annotateCurrentSpan({
+                              "executor.oauth.refresh.superseded_by_peer": true,
+                            });
+                            return { supersededBy: superseding };
+                          }
+                          if (superseding === "pending") {
+                            return yield* new StorageError({
+                              message: `A newer OAuth refresh for ${row.owner}/${row.integration}/${row.name} is still being saved; retry the call.`,
+                              cause: undefined,
+                            });
+                          }
+                          yield* markRefreshGrantDead(
+                            row,
+                            // oxlint-disable-next-line executor/no-unknown-error-message -- boundary: CredentialResolutionError carries a typed `message` field
+                            error.message,
+                            credentialFailureReason(error),
+                            startStamp,
+                          );
+                          return yield* error;
+                        })
+                      : Effect.fail(error),
                   ),
                 );
               });
 
+        if (token === REFRESH_LEASE_LOST) return REFRESH_LEASE_LOST;
+        if ("supersededBy" in token) return token.supersededBy;
+        if (lease !== undefined && storedRefreshToken !== undefined) {
+          const peerAccess = yield* settleLeasedGrant(row, provider, lease);
+          if (peerAccess !== null) return peerAccess;
+        }
         yield* persistRefreshedToken(row, provider, token, storedRefreshToken);
         return token.access_token;
       }).pipe(
@@ -2963,24 +3166,6 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         }),
       );
 
-    const refreshLeaseMs = config.oauthRefreshLeaseMs ?? DEFAULT_OAUTH_REFRESH_LEASE_MS;
-
-    const connectionRefOf = (row: ConnectionRow): ConnectionRef => ({
-      owner: row.owner as Owner,
-      integration: IntegrationSlug.make(row.integration),
-      name: ConnectionName.make(row.name),
-    });
-
-    const connectionRowWhere = (row: ConnectionRow) => (b: AnyCb) =>
-      b.and(
-        byOwner(row.owner as Owner)(b),
-        b("integration", "=", String(row.integration)),
-        b("name", "=", String(row.name)),
-      );
-
-    const refreshedAtOf = (row: ConnectionRow): number | null =>
-      row.oauth_refreshed_at == null ? null : Number(row.oauth_refreshed_at);
-
     const releaseRefreshLease = (row: ConnectionRow, holder: string) =>
       core
         .updateMany("connection", {
@@ -2989,10 +3174,6 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           set: { refresh_lease_until: null, refresh_lease_holder: null },
         })
         .pipe(Effect.ignore);
-
-    const pollDelay = Effect.promise(
-      () => new Promise<void>((resolve) => setTimeout(resolve, OAUTH_REFRESH_LEASE_POLL_MS)),
-    );
 
     /** The cross-instance layer of refresh single-flight. The in-isolate gate
      *  (`refreshInFlight`) only dedupes callers sharing one root DB handle; on
@@ -3016,22 +3197,34 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
     ): Effect.Effect<string | null, StorageFailure | CredentialResolutionError> => {
       const holder = crypto.randomUUID();
       const giveUpAt = Date.now() + refreshLeaseMs + refreshLeaseMs;
-      const attempt = (): Effect.Effect<
-        string | null,
-        StorageFailure | CredentialResolutionError
-      > =>
+      const timedOut = () =>
+        new StorageError({
+          message: `Timed out waiting for another instance to refresh the OAuth token for ${seen.owner}/${seen.integration}/${seen.name}; retry the call.`,
+          cause: undefined,
+        });
+      // `observed` is the last row this loop read before claiming: whether it
+      // named another holder is what says a won claim took over a lapsed lease.
+      const attempt = (
+        observed: ConnectionRow,
+      ): Effect.Effect<string | null, StorageFailure | CredentialResolutionError> =>
         Effect.gen(function* () {
           const now = Date.now();
           yield* core.updateMany("connection", {
             where: (b: AnyCb) =>
               b.and(
                 connectionRowWhere(seen)(b),
-                b.or(b.isNull("refresh_lease_until"), b("refresh_lease_until", "<=", now)),
+                b.or(
+                  b.isNull("refresh_lease_until"),
+                  b("refresh_lease_until", "<=", now - refreshLeaseMarginMs),
+                ),
               ),
             set: { refresh_lease_until: now + refreshLeaseMs, refresh_lease_holder: holder },
           });
           const fresh = yield* findConnectionRow(connectionRefOf(seen));
-          if (fresh === null) return yield* performTokenRefresh(seen, provider, trigger);
+          if (fresh === null) {
+            const access = yield* performTokenRefresh(seen, provider, trigger);
+            return access === REFRESH_LEASE_LOST ? null : access;
+          }
           const won = fresh.refresh_lease_holder === holder;
 
           const peerStamp = refreshedAtOf(fresh);
@@ -3045,21 +3238,26 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           }
 
           if (won) {
-            return yield* performTokenRefresh(fresh, provider, trigger).pipe(
+            const previousHolder = observed.refresh_lease_holder;
+            const lease: RefreshLease = {
+              holder,
+              leaseUntil: now + refreshLeaseMs,
+              startStamp: peerStamp,
+              tookOverLapsedLease: previousHolder != null && previousHolder !== holder,
+            };
+            const outcome = yield* performTokenRefresh(fresh, provider, trigger, lease).pipe(
               Effect.ensuring(releaseRefreshLease(seen, holder)),
             );
+            if (outcome !== REFRESH_LEASE_LOST) return outcome;
+            if (Date.now() >= giveUpAt) return yield* timedOut();
+            return yield* attempt(fresh);
           }
 
-          if (Date.now() >= giveUpAt) {
-            return yield* new StorageError({
-              message: `Timed out waiting for another instance to refresh the OAuth token for ${seen.owner}/${seen.integration}/${seen.name}; retry the call.`,
-              cause: undefined,
-            });
-          }
+          if (Date.now() >= giveUpAt) return yield* timedOut();
           yield* pollDelay;
-          return yield* attempt();
+          return yield* attempt(fresh);
         });
-      return attempt();
+      return attempt(seen);
     };
 
     const refreshConnectionToken = (

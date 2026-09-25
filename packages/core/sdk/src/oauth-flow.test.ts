@@ -1685,8 +1685,9 @@ describe("oauth token refresh in resolveConnectionValue", () => {
           ).toEqual([]);
 
           // The gate did still run for A — on an item of its own, holding no
-          // credential. Its grant then failed on the spent token, so it
-          // persisted nothing: this one write is everything A wrote.
+          // credential. It then found its lease gone and never sent the spent
+          // token, so it persisted nothing: this one write is everything A
+          // wrote.
           const writtenByA = writes.slice(writesBeforeAResumes);
           expect(writtenByA, "the resumed refresher wrote exactly one item").toHaveLength(1);
           expect(writtenByA[0], "and it was not the refresh token's own item").not.toBe(
@@ -1697,15 +1698,15 @@ describe("oauth token refresh in resolveConnectionValue", () => {
             "the item it wrote carries no credential",
           ).not.toContain(store.get(writtenByA[0]!));
 
-          // Both instances really did reach the authorization server, so the
-          // interleaving under test happened rather than being short-circuited.
+          // Only B reached the authorization server: A stalled past its lease,
+          // so it gave up the spent token instead of sending it.
           expect(
             (yield* server.requests).filter(
               (request) =>
                 request.path === "/token" && request.body.includes("grant_type=refresh_token"),
             ),
-            "both instances sent a refresh grant",
-          ).toHaveLength(2);
+            "only the peer that held the lease sent a refresh grant",
+          ).toHaveLength(1);
         }),
       ),
   );
@@ -2974,15 +2975,66 @@ describe("resource-less client sends no resource parameter (#1789)", () => {
 describe("oauth refresh across instances", () => {
   const twoInstancesOverOneExpiredConnection = (options: {
     readonly oauthRefreshLeaseMs?: number;
+    readonly revokeGrantOnReuse?: boolean;
   }) =>
     Effect.gen(function* () {
-      const server = yield* serveOAuthTestServer({ scopes: ["read"] });
+      const server = yield* serveOAuthTestServer({
+        scopes: ["read"],
+        ...(options.revokeGrantOnReuse === undefined
+          ? {}
+          : { revokeGrantOnReuse: options.revokeGrantOnReuse }),
+      });
       const store = new Map<string, string>();
       const pause = {
         next: false,
         reached: yield* Deferred.make<void>(),
         resume: yield* Deferred.make<void>(),
       };
+      // One-shot stop on the next write of a refresh token: the persist after
+      // a grant succeeded.
+      const pauseWrite = {
+        next: false,
+        reached: yield* Deferred.make<void>(),
+        resume: yield* Deferred.make<void>(),
+      };
+      // One-shot stop on instance A's next refresh grant, before it leaves for
+      // the authorization server. Releasing forwards it; an abort of the
+      // request while it waits is recorded and rejects it the way a real
+      // fetch would.
+      const grantA = {
+        next: false,
+        reached: yield* Deferred.make<void>(),
+        release: yield* Deferred.make<void>(),
+        abortedAt: null as number | null,
+      };
+      const grantSentAt = { a: [] as number[], b: [] as number[] };
+      const isRefreshGrant = (init: RequestInit | undefined) =>
+        String(init?.body ?? "").includes("refresh_token");
+      const fetchFor =
+        (instance: "a" | "b"): typeof globalThis.fetch =>
+        async (input, init) => {
+          if (instance === "a" && grantA.next && isRefreshGrant(init)) {
+            grantA.next = false;
+            await Effect.runPromise(Deferred.succeed(grantA.reached, undefined));
+            const signal = init?.signal;
+            await new Promise<void>((resolve, reject) => {
+              const onAbort = () => {
+                grantA.abortedAt = Date.now();
+                // oxlint-disable-next-line executor/no-promise-reject -- test boundary: an aborted fetch must reject with the signal's reason, as the platform fetch does
+                reject(signal?.reason);
+              };
+              if (signal?.aborted) return onAbort();
+              signal?.addEventListener("abort", onAbort, { once: true });
+              void Effect.runPromise(Deferred.await(grantA.release)).then(() => {
+                signal?.removeEventListener("abort", onAbort);
+                resolve();
+              });
+            });
+          }
+          if (isRefreshGrant(init)) grantSentAt[instance].push(Date.now());
+          // oxlint-disable-next-line executor/no-raw-fetch -- test boundary: the latch wraps the platform fetch and must delegate back to it to hold a refresh grant before it leaves
+          return globalThis.fetch(input, init);
+        };
       const sharedStore: CredentialProvider = {
         key: ProviderKey.make("shared-memory"),
         writable: true,
@@ -2996,7 +3048,15 @@ describe("oauth refresh across instances", () => {
             }
             return value;
           }),
-        set: (id, value) => Effect.sync(() => void store.set(String(id), value)),
+        set: (id, value) =>
+          Effect.gen(function* () {
+            if (pauseWrite.next && String(id).endsWith(":refresh")) {
+              pauseWrite.next = false;
+              yield* Deferred.succeed(pauseWrite.reached, undefined);
+              yield* Deferred.await(pauseWrite.resume);
+            }
+            store.set(String(id), value);
+          }),
         delete: (id) => Effect.sync(() => void store.delete(String(id))),
       };
       const config = {
@@ -3010,9 +3070,10 @@ describe("oauth refresh across instances", () => {
           ? {}
           : { oauthRefreshLeaseMs: options.oauthRefreshLeaseMs }),
       };
-      const instanceA = yield* createExecutor(config);
+      const instanceA = yield* createExecutor({ ...config, fetch: fetchFor("a") });
       const instanceB = yield* createExecutor({
         ...config,
+        fetch: fetchFor("b"),
         db: withQueryContext(config.testDb.db, {
           tenant: SHARED_STORE_TENANT,
           subject: SHARED_STORE_SUBJECT,
@@ -3023,6 +3084,7 @@ describe("oauth refresh across instances", () => {
       );
       yield* Effect.addFinalizer(() => instanceA.close().pipe(Effect.ignore));
       yield* Effect.addFinalizer(() => instanceB.close().pipe(Effect.ignore));
+      yield* Effect.addFinalizer(() => Deferred.succeed(grantA.release, undefined));
 
       yield* instanceA.acme.seed();
       yield* instanceA.oauth.createClient({
@@ -3065,7 +3127,29 @@ describe("oauth refresh across instances", () => {
             ).length,
         ),
       );
-      return { server, config, instanceA, instanceB, pause, refreshGrants };
+      const connectionRow = Effect.promise(() =>
+        config.db.findFirst("connection", { where: (b) => b("name", "=", "main") }),
+      );
+      const markedDead = connectionRow.pipe(
+        Effect.map(
+          (row) =>
+            (row?.provider_state as { oauthReauthRequiredAt?: number } | null)
+              ?.oauthReauthRequiredAt !== undefined,
+        ),
+      );
+      return {
+        server,
+        config,
+        instanceA,
+        instanceB,
+        pause,
+        pauseWrite,
+        grantA,
+        grantSentAt,
+        refreshGrants,
+        connectionRow,
+        markedDead,
+      };
     });
 
   const whoami = ToolAddress.make("tools.acme.org.main.whoami");
@@ -3107,7 +3191,7 @@ describe("oauth refresh across instances", () => {
     Effect.scoped(
       Effect.gen(function* () {
         const { server, config, instanceA, refreshGrants } =
-          yield* twoInstancesOverOneExpiredConnection({});
+          yield* twoInstancesOverOneExpiredConnection({ oauthRefreshLeaseMs: 1_200 });
 
         yield* Effect.promise(() =>
           config.db.updateMany("connection", {
@@ -3127,6 +3211,125 @@ describe("oauth refresh across instances", () => {
           config.db.findFirst("connection", { where: (b) => b("name", "=", "main") }),
         );
         expect(row?.refresh_lease_holder, "the survivor released its own lease").toBeNull();
+      }),
+    ),
+  );
+
+  it.effect("a holder that stalls past its lease before sending never spends the token", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { server, instanceA, instanceB, pause, refreshGrants, markedDead } =
+          yield* twoInstancesOverOneExpiredConnection({
+            oauthRefreshLeaseMs: 600,
+            revokeGrantOnReuse: true,
+          });
+
+        // A has the stored refresh token in hand and stalls there, past its
+        // lease. B takes the lapsed lease over and refreshes to completion.
+        pause.next = true;
+        const refresherA = yield* Effect.forkChild(instanceA.execute(whoami, {}));
+        yield* Deferred.await(pause.reached);
+        const resultB = (yield* instanceB.execute(whoami, {})) as { token: string };
+
+        // A wakes holding a token B already spent. Sending it would be a reuse,
+        // and this provider revokes the whole grant on reuse.
+        yield* Deferred.succeed(pause.resume, undefined);
+        const resultA = (yield* Fiber.join(refresherA)) as { token: string };
+
+        expect(yield* refreshGrants, "only the lease's live holder sent a grant").toBe(1);
+        expect(yield* server.acceptsAccessToken(resultA.token), "A's token works").toBe(true);
+        expect(yield* server.acceptsAccessToken(resultB.token), "B's token works").toBe(true);
+        expect(yield* markedDead, "the connection is still healthy").toBe(false);
+      }),
+    ),
+  );
+
+  it.effect("a grant still waiting on the provider is abandoned before its lease lapses", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { server, instanceA, instanceB, grantA, grantSentAt, refreshGrants } =
+          yield* twoInstancesOverOneExpiredConnection({ oauthRefreshLeaseMs: 1_200 });
+
+        // A's grant leaves and the provider never answers it.
+        grantA.next = true;
+        const refresherA = yield* Effect.forkChild(Effect.exit(instanceA.execute(whoami, {})));
+        yield* Deferred.await(grantA.reached);
+        const resultB = (yield* instanceB.execute(whoami, {})) as { token: string };
+        yield* Fiber.join(refresherA);
+
+        expect(grantA.abortedAt, "A gave up on its own grant").not.toBeNull();
+        expect(grantSentAt.b, "B sent one grant").toHaveLength(1);
+        expect(
+          grantSentAt.b[0]! >= grantA.abortedAt!,
+          "B only sent once A's request was abandoned",
+        ).toBe(true);
+        expect(yield* refreshGrants, "the provider saw only B's grant").toBe(1);
+        expect(yield* server.acceptsAccessToken(resultB.token)).toBe(true);
+      }),
+    ),
+  );
+
+  it.effect(
+    "an invalid_grant after a peer rotated the token returns the peer's token and keeps the connection",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const { server, config, instanceA, instanceB, grantA, markedDead } =
+            yield* twoInstancesOverOneExpiredConnection({ oauthRefreshLeaseMs: 3_000 });
+
+          // A's grant is on its way when its lease is lost (the isolate was
+          // paused long enough for it to lapse), and B refreshes meanwhile.
+          grantA.next = true;
+          const refresherA = yield* Effect.forkChild(instanceA.execute(whoami, {}));
+          yield* Deferred.await(grantA.reached);
+          yield* Effect.promise(() =>
+            config.db.updateMany("connection", {
+              where: (b) => b("name", "=", "main"),
+              set: { refresh_lease_until: Date.now() - 60_000 },
+            }),
+          );
+          const resultB = (yield* instanceB.execute(whoami, {})) as { token: string };
+
+          // A's spent refresh token now reaches the provider and is refused.
+          yield* Deferred.succeed(grantA.release, undefined);
+          const resultA = (yield* Fiber.join(refresherA)) as { token: string };
+
+          expect(resultA.token, "A uses the token B minted").toBe(resultB.token);
+          expect(yield* server.acceptsAccessToken(resultA.token)).toBe(true);
+          expect(yield* markedDead, "the connection is not marked dead").toBe(false);
+        }),
+      ),
+  );
+
+  it.effect("a slow persist keeps the lease, so a waiter never spends the token again", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { server, instanceA, instanceB, grantA, pauseWrite, refreshGrants, markedDead } =
+          yield* twoInstancesOverOneExpiredConnection({
+            oauthRefreshLeaseMs: 1_000,
+            revokeGrantOnReuse: true,
+          });
+
+        // A's grant takes a while and then succeeds; saving its rotated token
+        // then takes long enough to outlast the lease A first claimed.
+        grantA.next = true;
+        pauseWrite.next = true;
+        const refresherA = yield* Effect.forkChild(instanceA.execute(whoami, {}));
+        yield* Deferred.await(grantA.reached);
+        yield* realSleep(400);
+        yield* Deferred.succeed(grantA.release, undefined);
+        yield* Deferred.await(pauseWrite.reached);
+        const refresherB = yield* Effect.forkChild(instanceB.execute(whoami, {}));
+        yield* realSleep(800);
+        yield* Deferred.succeed(pauseWrite.resume, undefined);
+
+        const resultA = (yield* Fiber.join(refresherA)) as { token: string };
+        const resultB = (yield* Fiber.join(refresherB)) as { token: string };
+
+        expect(yield* refreshGrants, "the spent token was never sent again").toBe(1);
+        expect(yield* server.acceptsAccessToken(resultA.token), "A's token works").toBe(true);
+        expect(yield* server.acceptsAccessToken(resultB.token), "B's token works").toBe(true);
+        expect(yield* markedDead, "the connection is still healthy").toBe(false);
       }),
     ),
   );
