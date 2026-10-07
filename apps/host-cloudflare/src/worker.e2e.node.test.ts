@@ -9,6 +9,7 @@ import { unstable_dev, type Unstable_DevWorker } from "wrangler";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { generateApiKey, hashApiKey } from "./auth/api-keys";
 import { microsoftCatalog } from "@executor-js/plugin-openapi/providers/microsoft";
 
 // ---------------------------------------------------------------------------
@@ -649,4 +650,143 @@ describe("cloudflare host configuration errors", () => {
       );
     }
   });
+});
+
+describe("cloudflare host composite auth and REST tools (workerd/miniflare)", () => {
+  let worker: Unstable_DevWorker;
+  const apiKey = generateApiKey();
+
+  beforeAll(async () => {
+    ensureStaticAssets();
+    worker = await unstable_dev(resolve(dir, "worker.ts"), {
+      config: resolve(dir, "../wrangler.jsonc"),
+      ip: "127.0.0.1",
+      local: true,
+      persist: false,
+      experimental: { disableExperimentalWarning: true },
+      vars: {
+        EXECUTOR_SECRET_KEY: "test-secret-key-0123456789abcdef",
+        EXECUTOR_API_KEY_HASHES: `e2e:${await hashApiKey(apiKey)}`,
+        API_KEY_PRINCIPAL_EMAIL: "owner@example.com",
+        ENABLE_DEV_AUTH: "false",
+      },
+    });
+  }, 120_000);
+
+  afterAll(async () => {
+    await worker?.stop();
+  });
+
+  const post = (path: string, body: unknown, headers: Record<string, string> = {}) =>
+    worker.fetch(path, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...headers },
+      body: JSON.stringify(body),
+    });
+  const withKey = { authorization: `Bearer ${apiKey}` };
+
+  it("answers 401 to the API, REST tools and MCP without credentials", async () => {
+    expect((await worker.fetch("/api/account/me")).status).toBe(401);
+    expect((await post("/api/tools/search", { query: "x" })).status).toBe(401);
+    expect((await post("/api/tools/invoke", { tool: "t", arguments: {} })).status).toBe(401);
+    expect((await post("/mcp", { jsonrpc: "2.0", id: 1, method: "ping" })).status).toBe(401);
+  }, 60_000);
+
+  it("rejects a wrong API key", async () => {
+    const wrong = { authorization: `Bearer ${generateApiKey()}` };
+    expect((await post("/api/tools/search", { query: "x" }, wrong)).status).toBe(401);
+    expect((await worker.fetch("/api/account/me", { headers: wrong })).status).toBe(401);
+  }, 60_000);
+
+  it("resolves the API key to the owner's account", async () => {
+    const me = await worker.fetch("/api/account/me", { headers: { "x-api-key": apiKey } });
+    expect(me.status).toBe(200);
+    const body = (await me.json()) as { user: { id: string; email: string } };
+    expect(body.user).toMatchObject({ id: "owner@example.com", email: "owner@example.com" });
+  }, 60_000);
+
+  it("searches tools over REST with a key", async () => {
+    const response = await post("/api/tools/search", { query: "ping" }, withKey);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      items: [],
+      total: 0,
+      hasMore: false,
+      nextOffset: null,
+      ranked: true,
+    });
+  }, 60_000);
+
+  it("validates REST bodies and reports unknown tools explicitly", async () => {
+    expect((await post("/api/tools/search", { nope: 1 }, withKey)).status).toBe(400);
+    const unknown = await post(
+      "/api/tools/invoke",
+      { tool: "tools.github.org.main.nothing", arguments: {} },
+      withKey,
+    );
+    expect(unknown.status).toBe(404);
+    expect(await unknown.json()).toMatchObject({ status: "unavailable" });
+  }, 60_000);
+
+  it("searches a connected tool with its schema and runs the policy gate on invoke", async () => {
+    const slug = `pingapi-${runId}`;
+    const add = await post(
+      "/api/openapi/specs",
+      { spec: { kind: "blob", value: SPEC }, slug, baseUrl: "https://example.com" },
+      withKey,
+    );
+    expect(add.status).toBe(200);
+    const connect = await post(
+      "/api/connections",
+      { owner: "org", integration: slug, name: "main", template: "none", values: {} },
+      withKey,
+    );
+    expect(connect.status).toBe(200);
+
+    const search = await post("/api/tools/search", { query: "ping", integration: slug }, withKey);
+    expect(search.status).toBe(200);
+    const found = (await search.json()) as {
+      items: { id: string; inputSchema: unknown; integration: string }[];
+    };
+    expect(found.items).toHaveLength(1);
+    expect(found.items[0]).toMatchObject({ integration: slug, inputSchema: { type: "object" } });
+    const tool = found.items[0]!.id;
+
+    const policy = await post(
+      "/api/policies",
+      { owner: "org", pattern: `${slug}.*`, action: "require_approval" },
+      withKey,
+    );
+    expect(policy.status).toBe(200);
+
+    const gated = await post("/api/tools/invoke", { tool, arguments: {} }, withKey);
+    expect(gated.status).toBe(202);
+    expect(await gated.json()).toMatchObject({ status: "approval_required", tool });
+
+    const approved = await post(
+      "/api/tools/invoke",
+      { tool, arguments: {}, approved: true },
+      withKey,
+    );
+    expect(((await approved.json()) as { status: string }).status).not.toBe("approval_required");
+  }, 90_000);
+
+  it("initializes MCP with an API key", async () => {
+    const init = await post(
+      "/mcp",
+      {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-03-26",
+          capabilities: {},
+          clientInfo: { name: "test", version: "1" },
+        },
+      },
+      { ...withKey, accept: "application/json, text/event-stream" },
+    );
+    expect(init.status).toBe(200);
+    expect(init.headers.get("mcp-session-id")).toBeTruthy();
+  }, 60_000);
 });

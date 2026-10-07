@@ -107,6 +107,34 @@ export class ExecutorInternal extends WorkerEntrypoint<CloudflareEnv> {
   override fetch(request: Request): Promise<Response> {
     return handleInternalRequest(request, this.env, this.ctx);
   }
+
+  /** RPC: `POST /api/tools/search`, returning `{ status, body }`. */
+  searchTools(body: Record<string, unknown>): Promise<InternalRpcResult> {
+    return this.callRoute("/api/tools/search", body);
+  }
+
+  /** RPC: `POST /api/tools/invoke`, returning `{ status, body }`. */
+  invokeTool(body: Record<string, unknown>): Promise<InternalRpcResult> {
+    return this.callRoute("/api/tools/invoke", body);
+  }
+
+  private async callRoute(path: string, body: Record<string, unknown>): Promise<InternalRpcResult> {
+    const response = await handleInternalRequest(
+      new Request(`https://executor.internal${path}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      }),
+      this.env,
+      this.ctx,
+    );
+    return { status: response.status, body: await response.json() };
+  }
+}
+
+export interface InternalRpcResult {
+  readonly status: number;
+  readonly body: unknown;
 }
 
 export default {

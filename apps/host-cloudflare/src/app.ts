@@ -15,6 +15,7 @@ import {
 import { ErrorCaptureLive } from "./observability";
 import { cloudflareAccountMiddleware } from "./account/account-provider";
 import { makeCloudflareApprovalHandler } from "./mcp";
+import { makeCloudflareToolsHandler } from "./tools/rest";
 import { makeCloudflareMcpAgentHandler } from "./mcp/agent-handler";
 import { preloadQuickJs } from "./quickjs";
 
@@ -49,6 +50,7 @@ export const makeCloudflareApp = async (
   const identityLayer = cloudflareAccessIdentityLayer(config);
   const mcpAgentHandler = makeCloudflareMcpAgentHandler(config);
   const approvalHandler = makeCloudflareApprovalHandler(config, env);
+  const toolsHandler = makeCloudflareToolsHandler(config, dbHandle);
 
   const { appLayer, toWebHandler } = ExecutorApp.make({
     plugins,
@@ -72,6 +74,10 @@ export const makeCloudflareApp = async (
         // reads paused detail (GET) and records the decision (POST .../resume),
         // Access-gated, routed to the owning session's Durable Object.
         HttpRouter.add("*", "/api/mcp-sessions/*", HttpEffect.fromWebHandler(approvalHandler)),
+        // REST search/invoke for non-MCP callers (agents, posse): ranked tool
+        // discovery and single-tool invocation, authenticated by the composite auth.
+        HttpRouter.add("*", "/api/tools/search", HttpEffect.fromWebHandler(toolsHandler)),
+        HttpRouter.add("*", "/api/tools/invoke", HttpEffect.fromWebHandler(toolsHandler)),
       ],
     },
     config: { mountPrefix: "/api", failure: textFailureStrategy },
