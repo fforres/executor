@@ -5974,11 +5974,14 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           // Every finished attempt clears the start stamp, so a stamp still set
           // is an attempt that never reached the end.
           if (startedAt !== null && Date.now() - startedAt < TOOLS_SYNC_ATTEMPT_BACKOFF_MS) {
-            yield* Effect.logWarning("executor stale tool sync skipped: previous attempt unfinished", {
-              integration: connection.integration,
-              connection: connection.name,
-              startedAt,
-            });
+            yield* Effect.logWarning(
+              "executor stale tool sync skipped: previous attempt unfinished",
+              {
+                integration: connection.integration,
+                connection: connection.name,
+                startedAt,
+              },
+            );
             continue;
           }
 
