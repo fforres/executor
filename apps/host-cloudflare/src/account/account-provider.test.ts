@@ -17,6 +17,8 @@ const config: CloudflareConfig = {
   allowLocalNetwork: false,
   webBaseUrl: "https://localhost",
   enableDevAuth: false,
+  apiKeys: [],
+  apiKeyPrincipalEmail: "",
 };
 
 const rowFor = (claims: Record<string, unknown>) =>

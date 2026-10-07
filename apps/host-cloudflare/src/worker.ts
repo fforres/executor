@@ -1,9 +1,5 @@
 import { makeCloudflareApp } from "./app";
-import {
-  cloudflareAccessConfigErrorMessage,
-  missingCloudflareAccessVars,
-  type CloudflareEnv,
-} from "./config";
+import { cloudflareConfigProblem, type CloudflareEnv } from "./config";
 import { mcpResourceFromPath } from "./mcp/resource";
 
 // The MCP Durable Object classes, bound in wrangler.jsonc. They must be exported
@@ -32,8 +28,8 @@ const resolveHandler = (env: CloudflareEnv) => {
   return handlerPromise;
 };
 
-const accessConfigErrorResponse = (missingVars: readonly string[]): Response =>
-  new Response(`${cloudflareAccessConfigErrorMessage(missingVars)}\n`, {
+const configErrorResponse = (message: string): Response =>
+  new Response(`${message}\n`, {
     status: 503,
     headers: {
       "cache-control": "no-store",
@@ -43,9 +39,9 @@ const accessConfigErrorResponse = (missingVars: readonly string[]): Response =>
 
 export default {
   fetch: async (request: Request, env: CloudflareEnv, ctx: ExecutionContext): Promise<Response> => {
-    const missingAccessVars = missingCloudflareAccessVars(env);
-    if (missingAccessVars.length > 0) {
-      return accessConfigErrorResponse(missingAccessVars);
+    const configProblem = cloudflareConfigProblem(env);
+    if (configProblem !== null) {
+      return configErrorResponse(configProblem);
     }
 
     const serve = await resolveHandler(env);

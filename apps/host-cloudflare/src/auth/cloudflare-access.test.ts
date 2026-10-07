@@ -19,6 +19,8 @@ const config: CloudflareConfig = {
   allowLocalNetwork: false,
   webBaseUrl: "https://localhost",
   enableDevAuth: false,
+  apiKeys: [],
+  apiKeyPrincipalEmail: "",
 };
 
 describe("principalFromAccessClaims", () => {

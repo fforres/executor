@@ -1,9 +1,10 @@
-import { createRemoteJWKSet, jwtVerify } from "jose";
+import { createRemoteJWKSet, jwtVerify, type JWTVerifyGetKey } from "jose";
 import { Effect, Layer } from "effect";
 
 import { IdentityProvider, Unauthorized, type Principal } from "@executor-js/api/server";
 
 import type { CloudflareConfig } from "../config";
+import { matchApiKey, presentedApiKey } from "./api-keys";
 
 // ---------------------------------------------------------------------------
 // Cloudflare Access IdentityProvider — the CF-native swap for self-host's
@@ -144,20 +145,72 @@ export const applyDelegatedSubject = (
   };
 };
 
+const ACCESS_COOKIE = "CF_Authorization";
+
+const cookieValue = (header: string | null, name: string): string | null => {
+  for (const part of (header ?? "").split(";")) {
+    const separator = part.indexOf("=");
+    if (separator !== -1 && part.slice(0, separator).trim() === name) {
+      const value = part.slice(separator + 1).trim();
+      return value.length > 0 ? value : null;
+    }
+  }
+  return null;
+};
+
 /**
- * Resolve a request to its verified `Principal`, or `null` when the Access
- * assertion is missing/invalid. The single source of truth for "who is this
- * request", shared by the `IdentityProvider` (the API gate) and the MCP auth
- * provider (the `/mcp` gate) so both enforce Access identically.
+ * The Access JWT a request carries: the `Cf-Access-Jwt-Assertion` header Access
+ * injects on paths it protects, else the `CF_Authorization` cookie it sets for
+ * the whole hostname — which is what authenticates the browser UI on paths Access
+ * does not front (API and MCP stay public so API keys can reach them).
+ */
+export const accessTokenFromRequest = (request: Request): string | null =>
+  request.headers.get("Cf-Access-Jwt-Assertion") ||
+  cookieValue(request.headers.get("cookie"), ACCESS_COOKIE);
+
+/** The principal an API key acts as: the admin identified by `apiKeyPrincipalEmail`. */
+export const apiKeyPrincipal = (config: CloudflareConfig, label: string): Principal => ({
+  kind: "member",
+  accountId: identityKey(config.apiKeyPrincipalEmail),
+  organizationId: config.organizationId,
+  organizationName: config.organizationName,
+  organizationSlug: config.organizationSlug,
+  email: config.apiKeyPrincipalEmail,
+  name: `API key ${label}`,
+  avatarUrl: null,
+  roles: ["admin"],
+  orgRoleModel: "organization",
+  orgRole: "admin",
+});
+
+/**
+ * Resolve a request to its verified `Principal`, or `null` when no credential
+ * verifies. The single source of truth for "who is this request", shared by the
+ * `IdentityProvider` (the API gate) and the MCP auth provider (the `/mcp` gate).
+ * Fail-closed: a request is anonymous unless exactly one of these holds.
+ *
+ *   1. An API key (`Authorization: Bearer exk_...` or `x-api-key`) whose hash is
+ *      configured. A key that is presented but wrong is rejected outright — it
+ *      never falls through to another credential.
+ *   2. A verified Access JWT, from the header or the `CF_Authorization` cookie.
+ *   3. Dev auth (local only; `loadConfig` refuses it on a production marker).
  *
  * `jose` caches + rotates the team JWKS, so build the verifier once per config.
+ * `options.jwks` swaps the remote team key set (tests).
  */
-export const makeAccessVerifier = (config: CloudflareConfig) => {
+export const makeAccessVerifier = (
+  config: CloudflareConfig,
+  options: { readonly jwks?: JWTVerifyGetKey } = {},
+) => {
   const issuer = `https://${config.accessTeamDomain}`;
   // Cached, lazily-fetched team signing keys; jose handles rotation + caching.
-  const jwks = config.enableDevAuth
-    ? null
-    : createRemoteJWKSet(new URL(`${issuer}/cdn-cgi/access/certs`));
+  // Absent in dev-auth and API-key-only deployments (no Access configured).
+  const accessConfigured = config.accessTeamDomain.length > 0 && config.accessAud.length > 0;
+  const jwks: JWTVerifyGetKey | null =
+    options.jwks ??
+    (config.enableDevAuth || !accessConfigured
+      ? null
+      : createRemoteJWKSet(new URL(`${issuer}/cdn-cgi/access/certs`)));
 
   // Dev/single-user escape hatch: bypass Access entirely, every request is a
   // fixed admin. Only when explicitly enabled (and the instance is otherwise
@@ -176,11 +229,15 @@ export const makeAccessVerifier = (config: CloudflareConfig) => {
     orgRole: "admin",
   };
 
-  const verify = (request: Request): Effect.Effect<Principal | null> =>
+  const verifyApiKey = (key: string): Effect.Effect<Principal | null> =>
+    Effect.promise(() => matchApiKey(key, config.apiKeys)).pipe(
+      Effect.map((match) => (match ? apiKeyPrincipal(config, match.label) : null)),
+    );
+
+  const verifyAccess = (request: Request): Effect.Effect<Principal | null> =>
     Effect.gen(function* () {
-      if (config.enableDevAuth) return devPrincipal;
       if (!jwks) return null;
-      const token = request.headers.get("Cf-Access-Jwt-Assertion");
+      const token = accessTokenFromRequest(request);
       if (!token) return null;
 
       const verified = yield* Effect.tryPromise({
@@ -196,6 +253,14 @@ export const makeAccessVerifier = (config: CloudflareConfig) => {
       // Delegation runs AFTER verification, never instead of it: the caller is
       // always a fully verified Access principal first.
       return applyDelegatedSubject(principal, config, readDelegatedIdentity(request));
+    });
+
+  const verify = (request: Request): Effect.Effect<Principal | null> =>
+    Effect.gen(function* () {
+      if (config.enableDevAuth) return devPrincipal;
+      const key = presentedApiKey(request.headers);
+      if (key !== null) return yield* verifyApiKey(key);
+      return yield* verifyAccess(request);
     });
 
   return { verify };

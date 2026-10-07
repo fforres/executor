@@ -54,19 +54,16 @@ const protectedResourceMetadataResponse = (request: Request): Response => {
 };
 
 // ---------------------------------------------------------------------------
-// Cloudflare Access McpAuthProvider — the `/mcp` gate, identical identity to the
-// API gate. Cloudflare Access sits in front of the Worker and forwards the
-// signed `Cf-Access-Jwt-Assertion` on every request, including `/mcp`. So the
-// MCP auth seam reuses the SAME `makeAccessVerifier` the IdentityProvider uses:
-// validate the JWT, map claims onto the neutral `Principal`, done.
+// Composite McpAuthProvider — the `/mcp` gate, identical identity to the API gate.
+// It reuses the SAME `makeAccessVerifier` the IdentityProvider uses, which accepts
+// an API key (`Authorization: Bearer exk_...` / `x-api-key`) or a Cloudflare
+// Access JWT (header or `CF_Authorization` cookie) and maps either onto the
+// neutral `Principal`.
 //
-// There is no MCP OAuth here. Auth is Access's browser/service-token flow, not
-// the MCP `/authorize`+`/token` dance — so `discoveryRoutes` is empty and the
-// 401 challenge points at a nominal protected-resource URL only to satisfy
-// clients that probe for it. An external MCP client authenticates by presenting
-// an Access JWT (or `Cf-Access-Client-Id`/`-Secret` service-token headers, which
-// Access converts to one). When MCP OAuth-over-Access is needed, add the
-// discovery docs + a token endpoint here behind this same seam.
+// There is no MCP OAuth here, so `discoveryRoutes` only serves nominal
+// protected-resource documents for clients that probe for them. MCP clients
+// authenticate by presenting an API key, an Access JWT, or `Cf-Access-Client-Id`/
+// `-Secret` service-token headers (which Access converts to a JWT).
 // ---------------------------------------------------------------------------
 
 export const cloudflareAccessMcpAuth = (config: CloudflareConfig): Layer.Layer<McpAuthProvider> => {

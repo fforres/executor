@@ -3,6 +3,8 @@ import type { D1Database, DurableObjectNamespace, R2Bucket } from "@cloudflare/w
 import { isValidOrgSlug } from "@executor-js/api";
 import { missingPublicOriginWarning, resolvePublicOrigin } from "@executor-js/sdk/public-origin";
 
+import { parseApiKeyHashes, type ApiKeyHash } from "./auth/api-keys";
+
 let warnedNoCloudflareOrigin = false;
 
 // ---------------------------------------------------------------------------
@@ -63,6 +65,21 @@ export interface CloudflareEnv {
    * behind Access, or the instance is wide open.
    */
   readonly ENABLE_DEV_AUTH?: string;
+  /** Marks a deployed environment. `production` makes `ENABLE_DEV_AUTH` a boot error. */
+  readonly ENVIRONMENT?: string;
+  /**
+   * Comma-separated SHA-256 hashes (hex) of the API keys accepted as
+   * `Authorization: Bearer <key>` or `x-api-key`, each optionally written
+   * `label:hash`. Only hashes are stored — mint one with
+   * `bun run apps/host-cloudflare/scripts/api-key.ts create`. A `wrangler secret`.
+   */
+  readonly EXECUTOR_API_KEY_HASHES?: string;
+  /**
+   * Email of the admin principal every API key acts as. It keys the same account a
+   * browser session for that email resolves to, so personal connections are shared.
+   * Required whenever `EXECUTOR_API_KEY_HASHES` is set.
+   */
+  readonly API_KEY_PRINCIPAL_EMAIL?: string;
 }
 
 export interface CloudflareConfig {
@@ -84,6 +101,10 @@ export interface CloudflareConfig {
    *  static URL — the per-request origin is used instead (see RequestWebOrigin). */
   readonly webBaseUrl?: string;
   readonly enableDevAuth: boolean;
+  /** Accepted API keys (hash only). Empty disables API-key auth. */
+  readonly apiKeys: readonly ApiKeyHash[];
+  /** The principal every API key acts as. Set whenever `apiKeys` is non-empty. */
+  readonly apiKeyPrincipalEmail: string;
 }
 
 type CloudflareConfigEnv = Omit<
@@ -93,7 +114,12 @@ type CloudflareConfigEnv = Omit<
 
 type CloudflareAccessEnv = Pick<
   CloudflareConfigEnv,
-  "ACCESS_TEAM_DOMAIN" | "ACCESS_AUD" | "ENABLE_DEV_AUTH"
+  | "ACCESS_TEAM_DOMAIN"
+  | "ACCESS_AUD"
+  | "ENABLE_DEV_AUTH"
+  | "ENVIRONMENT"
+  | "EXECUTOR_API_KEY_HASHES"
+  | "API_KEY_PRINCIPAL_EMAIL"
 >;
 
 const splitLower = (value: string | undefined): readonly string[] =>
@@ -108,17 +134,49 @@ const normalizeAccessTeamDomain = (value: string | undefined): string =>
     .replace(/^https?:\/\//, "")
     .replace(/\/+$/, "");
 
+const hasApiKeys = (env: CloudflareAccessEnv): boolean =>
+  (env.EXECUTOR_API_KEY_HASHES ?? "").trim().length > 0;
+
+/**
+ * Names the Access variables still missing. With API keys configured, leaving
+ * both Access variables unset is a valid API-key-only deployment (the JWT path is
+ * then disabled); setting only one of them is always an error.
+ */
 export const missingCloudflareAccessVars = (env: CloudflareAccessEnv): readonly string[] => {
   if (env.ENABLE_DEV_AUTH === "true") return [];
   const accessTeamDomain = normalizeAccessTeamDomain(env.ACCESS_TEAM_DOMAIN);
   const accessAud = (env.ACCESS_AUD ?? "").trim();
+  const teamDomainMissing =
+    accessTeamDomain.length === 0 ||
+    accessTeamDomain.toLowerCase() === "your-team.cloudflareaccess.com";
+  const audMissing = accessAud.length === 0;
+  if (hasApiKeys(env) && accessTeamDomain.length === 0 && audMissing) return [];
   return [
-    ...(accessTeamDomain.length === 0 ||
-    accessTeamDomain.toLowerCase() === "your-team.cloudflareaccess.com"
-      ? ["ACCESS_TEAM_DOMAIN"]
-      : []),
-    ...(accessAud.length === 0 ? ["ACCESS_AUD"] : []),
+    ...(teamDomainMissing ? ["ACCESS_TEAM_DOMAIN"] : []),
+    ...(audMissing ? ["ACCESS_AUD"] : []),
   ];
+};
+
+/**
+ * Dev auth makes every request a fixed admin, so it must never survive into a
+ * deployment: an Access audience or `ENVIRONMENT=production` marks one.
+ */
+export const devAuthInProductionError = (env: CloudflareAccessEnv): string | null => {
+  if (env.ENABLE_DEV_AUTH !== "true") return null;
+  const production =
+    (env.ENVIRONMENT ?? "").trim().toLowerCase() === "production" ||
+    (env.ACCESS_AUD ?? "").trim().length > 0;
+  return production
+    ? "ENABLE_DEV_AUTH is set on a production deployment (ACCESS_AUD or ENVIRONMENT=production is set). Refusing to serve requests; unset ENABLE_DEV_AUTH."
+    : null;
+};
+
+/** The first reason this environment must not serve requests, or null. */
+export const cloudflareConfigProblem = (env: CloudflareAccessEnv): string | null => {
+  const devAuth = devAuthInProductionError(env);
+  if (devAuth) return devAuth;
+  const missing = missingCloudflareAccessVars(env);
+  return missing.length > 0 ? cloudflareAccessConfigErrorMessage(missing) : null;
 };
 
 export const cloudflareAccessConfigErrorMessage = (missingVars: readonly string[]): string =>
@@ -147,6 +205,11 @@ export const loadConfig = (env: CloudflareConfigEnv): CloudflareConfig => {
       "EXECUTOR_SECRET_KEY must be set (wrangler secret put EXECUTOR_SECRET_KEY) — it encrypts stored secrets at rest in D1",
     );
   }
+  const devAuthError = devAuthInProductionError(env);
+  if (devAuthError) {
+    // oxlint-disable-next-line executor/no-try-catch-or-throw, executor/no-error-constructor -- boundary: dev auth in production is a wide-open instance; refuse to boot
+    throw new Error(devAuthError);
+  }
   const enableDevAuth = env.ENABLE_DEV_AUTH === "true";
   const accessTeamDomain = normalizeAccessTeamDomain(env.ACCESS_TEAM_DOMAIN);
   const accessAud = (env.ACCESS_AUD ?? "").trim();
@@ -154,6 +217,18 @@ export const loadConfig = (env: CloudflareConfigEnv): CloudflareConfig => {
   if (missingAccessVars.length > 0) {
     // oxlint-disable-next-line executor/no-try-catch-or-throw, executor/no-error-constructor -- boundary: production must fail closed without a valid Access verifier
     throw new Error(cloudflareAccessConfigErrorMessage(missingAccessVars));
+  }
+  const apiKeys = parseApiKeyHashes(env.EXECUTOR_API_KEY_HASHES);
+  if (typeof apiKeys === "string") {
+    // oxlint-disable-next-line executor/no-try-catch-or-throw, executor/no-error-constructor -- boundary: a malformed key list must not silently disable or weaken auth
+    throw new Error(apiKeys);
+  }
+  const apiKeyPrincipalEmail = (env.API_KEY_PRINCIPAL_EMAIL ?? "").trim().toLowerCase();
+  if (apiKeys.length > 0 && !apiKeyPrincipalEmail.includes("@")) {
+    // oxlint-disable-next-line executor/no-try-catch-or-throw, executor/no-error-constructor -- boundary: API keys need a principal to act as
+    throw new Error(
+      "API_KEY_PRINCIPAL_EMAIL must be set to an email when EXECUTOR_API_KEY_HASHES is configured",
+    );
   }
   const webBaseUrl = resolvePublicOrigin({ explicit: env.VITE_PUBLIC_SITE_URL, env: {} });
   if (!webBaseUrl && !enableDevAuth && !warnedNoCloudflareOrigin) {
@@ -185,5 +260,7 @@ export const loadConfig = (env: CloudflareConfigEnv): CloudflareConfig => {
     // mirroring self-host (gated on enableDevAuth = local `wrangler dev`).
     webBaseUrl,
     enableDevAuth,
+    apiKeys,
+    apiKeyPrincipalEmail,
   };
 };

@@ -64,6 +64,40 @@ The Access values are live Worker variables, not values in `wrangler.jsonc`.
 Wrangler's `keep_vars` option preserves them during later code deploys. Run the
 command above again whenever you need to change them.
 
+## API keys and a public API/MCP
+
+Agents and MCP clients that cannot do an Access browser login authenticate with an
+API key instead, so `/api/*` and `/mcp` can be public while still gated:
+
+```bash
+bun run apps/host-cloudflare/scripts/api-key.ts create --label posse
+```
+
+The command prints the plaintext key once (hand it to the caller, who sends
+`Authorization: Bearer exk_...` or `x-api-key: exk_...`) and a `label:hash` entry.
+Only hashes are stored: put the entries (comma-separated for several keys) in the
+`EXECUTOR_API_KEY_HASHES` secret and set `API_KEY_PRINCIPAL_EMAIL` to the owner's
+email. Every key acts as that admin, and because identity is keyed on the email it
+resolves to the same account as that person's browser session, so personal
+connections are shared. A wrong key is a 401; it never falls back to another
+credential.
+
+The Access JWT is read from the `Cf-Access-Jwt-Assertion` header or the
+`CF_Authorization` cookie, so Access only has to front the UI paths: the browser
+logs in there and the cookie (set for the whole hostname) then authenticates the
+UI's own `/api` calls. Leaving both `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD` unset
+with API keys configured is a valid API-key-only deployment.
+
+Routes that must stay reachable without an Access login: `/mcp*`, `/api/*` for
+key-authenticated callers, `/.well-known/*` (MCP discovery, OAuth client metadata)
+and the OAuth callback `/api/oauth/callback`. The callback is hit by the provider's
+redirect in the browser that started the flow, so it authenticates with that
+browser's `CF_Authorization` cookie; do not put it behind an Access policy that
+would redirect it away.
+
+`ENABLE_DEV_AUTH` is refused at boot (503) when `ACCESS_AUD` is set or
+`ENVIRONMENT=production`.
+
 ## Local development
 
 ```bash

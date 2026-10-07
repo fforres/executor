@@ -58,6 +58,50 @@ describe("loadConfig", () => {
   });
 });
 
+describe("loadConfig API keys", () => {
+  const hash = "a".repeat(64);
+
+  it("allows an API-key-only deployment with Access unset", () => {
+    expect(
+      loadConfig(
+        makeEnv({
+          EXECUTOR_API_KEY_HASHES: `posse:${hash}`,
+          API_KEY_PRINCIPAL_EMAIL: "Me@Example.com",
+        }),
+      ),
+    ).toMatchObject({
+      apiKeys: [{ label: "posse", hash }],
+      apiKeyPrincipalEmail: "me@example.com",
+    });
+  });
+
+  it("still rejects a half-configured Access setup when keys are present", () => {
+    expect(() =>
+      loadConfig(
+        makeEnv({
+          EXECUTOR_API_KEY_HASHES: hash,
+          API_KEY_PRINCIPAL_EMAIL: "me@example.com",
+          ACCESS_AUD: "aud-tag",
+        }),
+      ),
+    ).toThrowError("Set ACCESS_TEAM_DOMAIN before serving requests");
+  });
+
+  it("requires a principal email for the keys", () => {
+    expect(() => loadConfig(makeEnv({ EXECUTOR_API_KEY_HASHES: hash }))).toThrowError(
+      "API_KEY_PRINCIPAL_EMAIL must be set",
+    );
+  });
+
+  it("rejects a malformed hash list", () => {
+    expect(() =>
+      loadConfig(
+        makeEnv({ EXECUTOR_API_KEY_HASHES: "nope", API_KEY_PRINCIPAL_EMAIL: "me@example.com" }),
+      ),
+    ).toThrowError("not a SHA-256 hash");
+  });
+});
+
 describe("Cloudflare deployment configuration", () => {
   it("preserves operator-managed Access variables across deploys", () => {
     const config = parse(readFileSync(new URL("../wrangler.jsonc", import.meta.url), "utf8")) as {
