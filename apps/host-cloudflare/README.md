@@ -95,6 +95,11 @@ redirect in the browser that started the flow, so it authenticates with that
 browser's `CF_Authorization` cookie; do not put it behind an Access policy that
 would redirect it away.
 
+A request authenticated only by the `CF_Authorization` cookie must prove it came
+from this origin before it may change state (anything but GET, HEAD, OPTIONS): a
+same-origin `Origin` header or `Sec-Fetch-Site: same-origin`. API keys and the
+`Cf-Access-Jwt-Assertion` header need no such proof.
+
 `ENABLE_DEV_AUTH` is refused at boot (503) when `ACCESS_AUD` is set or
 `ENVIRONMENT=production`.
 
@@ -114,9 +119,10 @@ differently.
    authenticates the UI's own `/api` calls and `/api/oauth/callback`.
 3. **`ExecutorInternal` service-binding door.** Workers in the same Cloudflare
    account call the Worker through a service binding with no credential and act
-   as the owner (`API_KEY_PRINCIPAL_EMAIL`). The entrypoint has no public route
-   and builds its own trusted app; nothing in a request or in `env` can turn the
-   public door into this mode. In the calling worker's `wrangler.jsonc`:
+   as the owner (`API_KEY_PRINCIPAL_EMAIL`). It is RPC only (no `fetch`), has no
+   public route and calls the tool service directly; nothing in a request or in
+   `env` can turn the public door into this mode. In the calling worker's
+   `wrangler.jsonc`:
 
    ```jsonc
    "services": [
@@ -124,9 +130,23 @@ differently.
    ]
    ```
 
-   Then `await env.EXECUTOR.searchTools({ query: "..." })` and
-   `await env.EXECUTOR.invokeTool({ ... })` (RPC, returning `{ status, body }`),
-   or `env.EXECUTOR.fetch(request)` for any other route.
+   Then:
+   - `await env.EXECUTOR.searchTools({ query, integrations?, integration?, owner?,
+connection?, limit?, offset? })` ranks the catalog once, limited to the
+     `integrations` allow list (exact slugs; `[]` allows nothing), and returns a
+     page `{ items, total, hasMore, nextOffset, ranked? }`, or
+     `{ status: "invalid_arguments", message }`.
+   - `await env.EXECUTOR.invokeTool({ tool, arguments, approved? })` returns
+     `{ status: "ok" | "approval_required" | "blocked" | "unavailable" |
+"invalid_arguments" | "input_required" | "error", ... }`. A result over
+     100,000 characters comes back as bounded text with `truncated: true` and
+     `originalLength`.
+   - `await env.EXECUTOR.overview()` returns `{ integrations: [{ slug, name,
+description?, toolCount }], toolCount }`, without the built-in `executor`
+     integration.
+
+   The public door serves the same three as `POST /api/tools/search`,
+   `POST /api/tools/invoke` and `GET /api/tools/overview`.
 
 ## Local development
 
@@ -134,6 +154,7 @@ differently.
 # .dev.vars
 EXECUTOR_SECRET_KEY=dev-secret-key-0123456789abcdef
 ENABLE_DEV_AUTH=true     # bypass Access; every request is a fixed dev admin
+API_KEY_PRINCIPAL_EMAIL=you@example.com   # optional: the dev admin IS this owner account
 
 bun run build            # vite build -> dist/ (the SPA)
 bunx wrangler dev --local   # serves the SPA + Worker API together

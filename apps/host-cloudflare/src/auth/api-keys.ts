@@ -1,3 +1,7 @@
+import { Effect } from "effect";
+
+import { sha256Hex } from "@executor-js/sdk";
+
 // ---------------------------------------------------------------------------
 // API keys for non-browser callers (agents, MCP clients, other services). A key
 // is a high-entropy random token with a recognizable prefix; the Worker stores
@@ -17,17 +21,13 @@ export interface ApiKeyHash {
 const HEX_SHA256 = /^[0-9a-f]{64}$/;
 const LABEL = /^[A-Za-z0-9._-]{1,64}$/;
 
-const toHex = (bytes: ArrayBuffer): string =>
-  Array.from(new Uint8Array(bytes), (byte) => byte.toString(16).padStart(2, "0")).join("");
-
 const toBase64Url = (bytes: Uint8Array): string =>
   btoa(String.fromCharCode(...bytes))
     .replace(/\+/g, "-")
     .replace(/\//g, "_")
     .replace(/=+$/, "");
 
-export const hashApiKey = async (key: string): Promise<string> =>
-  toHex(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(key)));
+export const hashApiKey = (key: string): Promise<string> => Effect.runPromise(sha256Hex(key));
 
 /** Mint a new key: 256 bits of randomness behind the `exk_` prefix. */
 export const generateApiKey = (): string =>
@@ -69,11 +69,8 @@ export const presentedApiKey = (headers: Headers): string | null => {
 
 const constantTimeEqual = (a: string, b: string): boolean => {
   if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let index = 0; index < a.length; index++) {
-    diff |= a.charCodeAt(index) ^ b.charCodeAt(index);
-  }
-  return diff === 0;
+  const encoder = new TextEncoder();
+  return crypto.subtle.timingSafeEqual(encoder.encode(a), encoder.encode(b));
 };
 
 /** The configured key whose hash matches `key`, comparing against every entry. */

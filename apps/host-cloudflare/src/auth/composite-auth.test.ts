@@ -5,7 +5,7 @@ import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT } from "jose";
 import { McpAuthProvider } from "@executor-js/host-mcp";
 
 import { cloudflareAccessMcpAuth } from "../mcp/auth";
-import { internalConfigProblem, loadConfig, type CloudflareConfig } from "../config";
+import { loadConfig, type CloudflareConfig } from "../config";
 import { generateApiKey, hashApiKey } from "./api-keys";
 import { makeAccessVerifier } from "./cloudflare-access";
 
@@ -93,6 +93,65 @@ describe("composite auth: API keys", () => {
   });
 });
 
+describe("composite auth: Access cookie on state-changing requests", () => {
+  const post = (headers: Record<string, string>) =>
+    Effect.runPromise(
+      makeAccessVerifier(config, { jwks }).verify(
+        new Request("https://executor.example.com/api/tools/invoke", {
+          method: "POST",
+          headers,
+        }),
+      ),
+    );
+  const cookie = async () => ({
+    cookie: `CF_Authorization=${await signAccessJwt({ email: "owner@example.com" })}`,
+  });
+
+  it("rejects a cookie-only POST with no same-origin proof", async () => {
+    expect(await post(await cookie())).toBeNull();
+  });
+
+  it("rejects a cookie-only POST from another origin", async () => {
+    expect(await post({ ...(await cookie()), origin: "https://evil.example.com" })).toBeNull();
+  });
+
+  it("accepts a cookie-only POST with a same-origin Origin", async () => {
+    expect(
+      (await post({ ...(await cookie()), origin: "https://executor.example.com" }))?.accountId,
+    ).toBe("owner@example.com");
+  });
+
+  it("accepts a cookie-only POST with Sec-Fetch-Site: same-origin", async () => {
+    expect((await post({ ...(await cookie()), "sec-fetch-site": "same-origin" }))?.accountId).toBe(
+      "owner@example.com",
+    );
+  });
+
+  it("rejects a cookie-only POST marked cross-site", async () => {
+    expect(await post({ ...(await cookie()), "sec-fetch-site": "cross-site" })).toBeNull();
+  });
+
+  it("does not ask a cookie-only GET for proof", async () => {
+    expect((await verify(await cookie()))?.accountId).toBe("owner@example.com");
+  });
+
+  it("does not ask the Access header for proof, it is never attached by a browser alone", async () => {
+    expect(
+      (
+        await post({
+          "cf-access-jwt-assertion": await signAccessJwt({ email: "owner@example.com" }),
+        })
+      )?.accountId,
+    ).toBe("owner@example.com");
+  });
+
+  it("does not ask an API key for proof", async () => {
+    expect((await post({ authorization: `Bearer ${apiKey}` }))?.accountId).toBe(
+      "owner@example.com",
+    );
+  });
+});
+
 describe("composite auth: unauthenticated and Access", () => {
   it("rejects a request with no credentials", async () => {
     expect(await verify()).toBeNull();
@@ -155,6 +214,26 @@ describe("dev auth in production", () => {
     expect(loadConfig(base).enableDevAuth).toBe(true);
   });
 
+  it("acts as the owner account when an owner email is configured", async () => {
+    const principal = await Effect.runPromise(
+      makeAccessVerifier(
+        loadConfig({ ...base, API_KEY_PRINCIPAL_EMAIL: "Owner@Example.com" }),
+      ).verify(request()),
+    );
+    expect(principal).toMatchObject({
+      accountId: "owner@example.com",
+      email: "owner@example.com",
+      orgRole: "admin",
+    });
+  });
+
+  it("falls back to a fixed dev account without an owner email", async () => {
+    const principal = await Effect.runPromise(
+      makeAccessVerifier(loadConfig(base)).verify(request()),
+    );
+    expect(principal?.accountId).toBe("dev");
+  });
+
   it("is refused when ACCESS_AUD is set", () => {
     expect(() => loadConfig({ ...base, ACCESS_AUD: "aud-tag" })).toThrowError(
       /ENABLE_DEV_AUTH is set on a production deployment/,
@@ -201,8 +280,6 @@ describe("internal service-binding door", () => {
     );
     const hostile = {
       "x-executor-internal": "true",
-      "x-executor-subject": "owner@example.com",
-      "x-executor-subject-email": "owner@example.com",
       "cf-connecting-ip": "127.0.0.1",
       host: "executor.internal",
     };
@@ -212,8 +289,6 @@ describe("internal service-binding door", () => {
   });
 
   it("refuses to serve without the owner's email", () => {
-    expect(internalConfigProblem({})).toMatch(/API_KEY_PRINCIPAL_EMAIL/);
-    expect(internalConfigProblem({ API_KEY_PRINCIPAL_EMAIL: "owner@example.com" })).toBeNull();
     expect(() =>
       loadConfig({ ...env, API_KEY_PRINCIPAL_EMAIL: undefined }, { internal: true }),
     ).toThrowError(/API_KEY_PRINCIPAL_EMAIL must be set/);

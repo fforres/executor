@@ -752,6 +752,32 @@ describe("cloudflare host composite auth and REST tools (workerd/miniflare)", ()
     expect(found.items[0]).toMatchObject({ integration: slug, inputSchema: { type: "object" } });
     const tool = found.items[0]!.id;
 
+    const allowed = await post(
+      "/api/tools/search",
+      { query: "ping", integrations: [slug, "elsewhere"] },
+      withKey,
+    );
+    expect(((await allowed.json()) as { items: { id: string }[] }).items.map((i) => i.id)).toEqual([
+      tool,
+    ]);
+    const excluded = await post(
+      "/api/tools/search",
+      { query: "ping", integrations: ["elsewhere"] },
+      withKey,
+    );
+    expect(((await excluded.json()) as { items: unknown[] }).items).toEqual([]);
+
+    const overview = await worker.fetch("/api/tools/overview", { headers: withKey });
+    expect(overview.status).toBe(200);
+    const counted = (await overview.json()) as {
+      integrations: { slug: string; toolCount: number }[];
+      toolCount: number;
+    };
+    expect(counted.integrations.find((item) => item.slug === slug)).toMatchObject({
+      toolCount: 1,
+    });
+    expect(counted.integrations.some((item) => item.slug === "executor")).toBe(false);
+
     const policy = await post(
       "/api/policies",
       { owner: "org", pattern: `${slug}.*`, action: "require_approval" },

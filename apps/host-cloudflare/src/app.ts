@@ -1,7 +1,12 @@
 import { Effect } from "effect";
 import { HttpEffect, HttpRouter } from "effect/unstable/http";
 
-import { dbProviderLayer, ExecutorApp, textFailureStrategy } from "@executor-js/api/server";
+import {
+  dbProviderLayer,
+  ExecutorApp,
+  textFailureStrategy,
+  type ExecutorDbHandle,
+} from "@executor-js/api/server";
 
 import { loadConfig, type CloudflareConfig, type CloudflareEnv } from "./config";
 import { makeCloudflarePlugins } from "./plugins";
@@ -16,6 +21,7 @@ import { ErrorCaptureLive } from "./observability";
 import { cloudflareAccountMiddleware } from "./account/account-provider";
 import { makeCloudflareApprovalHandler } from "./mcp";
 import { makeCloudflareToolsHandler } from "./tools/rest";
+import { makeCloudflareToolsService } from "./tools/service";
 import { makeCloudflareMcpAgentHandler } from "./mcp/agent-handler";
 import { preloadQuickJs } from "./quickjs";
 
@@ -37,6 +43,8 @@ import { preloadQuickJs } from "./quickjs";
 export const makeCloudflareApp = async (
   env: CloudflareEnv,
   config: CloudflareConfig = loadConfig(env),
+  /** The opened D1 handle, when the caller already has one to share. */
+  sharedDbHandle?: ExecutorDbHandle,
 ) => {
   const plugins = makeCloudflarePlugins(config.secretKey);
 
@@ -46,11 +54,14 @@ export const makeCloudflareApp = async (
 
   // Open and idempotently bring up the D1 schema once. This is the long-lived
   // handle the per-request scoped executor reads through the DbProvider seam.
-  const dbHandle = await createD1ExecutorDb(env.DB, env.BLOBS);
+  const dbHandle = sharedDbHandle ?? (await createD1ExecutorDb(env.DB, env.BLOBS));
   const identityLayer = cloudflareAccessIdentityLayer(config);
   const mcpAgentHandler = makeCloudflareMcpAgentHandler(config);
   const approvalHandler = makeCloudflareApprovalHandler(config, env);
-  const toolsHandler = makeCloudflareToolsHandler(config, dbHandle);
+  const toolsHandler = makeCloudflareToolsHandler(
+    config,
+    makeCloudflareToolsService(config, dbHandle),
+  );
 
   const { appLayer, toWebHandler } = ExecutorApp.make({
     plugins,
@@ -74,9 +85,11 @@ export const makeCloudflareApp = async (
         // reads paused detail (GET) and records the decision (POST .../resume),
         // Access-gated, routed to the owning session's Durable Object.
         HttpRouter.add("*", "/api/mcp-sessions/*", HttpEffect.fromWebHandler(approvalHandler)),
-        // REST search/invoke for non-MCP callers (agents, posse): ranked tool
-        // discovery and single-tool invocation, authenticated by the composite auth.
+        // REST search/overview/invoke for non-MCP callers (agents, posse): ranked
+        // tool discovery, the catalog overview and single-tool invocation,
+        // authenticated by the composite auth.
         HttpRouter.add("*", "/api/tools/search", HttpEffect.fromWebHandler(toolsHandler)),
+        HttpRouter.add("*", "/api/tools/overview", HttpEffect.fromWebHandler(toolsHandler)),
         HttpRouter.add("*", "/api/tools/invoke", HttpEffect.fromWebHandler(toolsHandler)),
       ],
     },

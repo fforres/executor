@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "@effect/vitest";
 import { parse } from "jsonc-parser";
 
-import { loadConfig } from "./config";
+import { loadConfig, loadConfigResult } from "./config";
 
 type ConfigEnv = Parameters<typeof loadConfig>[0];
 
@@ -54,6 +54,33 @@ describe("loadConfig", () => {
       accessAud: "aud-tag",
       adminEmails: [],
       enableDevAuth: false,
+    });
+  });
+});
+
+describe("loadConfigResult", () => {
+  it("reports the refusal as a message instead of throwing", () => {
+    expect(loadConfigResult(makeEnv())).toEqual({
+      ok: false,
+      message:
+        "Cloudflare Access is not configured. Set ACCESS_TEAM_DOMAIN and ACCESS_AUD before serving requests.",
+    });
+  });
+
+  it("refuses the same way loadConfig does for a missing secret key and a bad slug", () => {
+    expect(loadConfigResult(makeEnv({ EXECUTOR_SECRET_KEY: "short" }))).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("EXECUTOR_SECRET_KEY must be set"),
+    });
+    expect(
+      loadConfigResult(makeEnv({ ENABLE_DEV_AUTH: "true", SELF_HOSTED_ORG_SLUG: "api" })),
+    ).toMatchObject({ ok: false, message: expect.stringContaining("SELF_HOSTED_ORG_SLUG") });
+  });
+
+  it("returns the config when valid", () => {
+    expect(loadConfigResult(makeEnv({ ENABLE_DEV_AUTH: "true" }))).toMatchObject({
+      ok: true,
+      config: { enableDevAuth: true, organizationSlug: "default" },
     });
   });
 });

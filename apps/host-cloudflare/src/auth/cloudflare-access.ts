@@ -38,9 +38,8 @@ const identityKey = (value: string): string => value.trim().toLowerCase();
  * as unique to an email address per account but NOT durable: remove and re-add a
  * user's seat and they come back with a different one, which would orphan every
  * connection they own. The email is the identifier that survives that, and it is
- * also the only one a delegating backend can know about a person (see
- * `applyDelegatedSubject`), so keying on it is what lets a browser session and an
- * agent acting for that same person reach the same rows.
+ * also what API keys act as (`ownerPrincipal`), so keying on it lets a browser
+ * session and an API-key caller for that same person reach the same rows.
  */
 export const principalFromAccessClaims = (
   claims: Record<string, unknown>,
@@ -69,82 +68,6 @@ export const principalFromAccessClaims = (
   };
 };
 
-/** Header naming the subject a trusted delegating caller is acting for. */
-export const DELEGATED_SUBJECT_HEADER = "X-Executor-Subject";
-/** Header carrying that subject's email, so roles resolve as they would in a browser. */
-export const DELEGATED_EMAIL_HEADER = "X-Executor-Subject-Email";
-
-/** The delegation a request asserts, read straight off the headers (both null on
- *  an ordinary request). */
-export interface DelegatedIdentity {
-  readonly subject: string | null;
-  readonly email: string | null;
-}
-
-export const readDelegatedIdentity = (request: Request): DelegatedIdentity => ({
-  subject: request.headers.get(DELEGATED_SUBJECT_HEADER),
-  email: request.headers.get(DELEGATED_EMAIL_HEADER),
-});
-
-/**
- * Re-bind a verified principal to the subject a TRUSTED service token says it is
- * acting for. Cloudflare Access authenticates browsers and machines, but has no
- * way to express "this backend is acting for Alice" — a service token's identity
- * is the token. Without this, a headless agent can only ever reach `owner: "org"`
- * rows, because its subject never matches any human's.
- *
- * The subject a delegator sends is that person's EMAIL, the same key a browser
- * session resolves to in `principalFromAccessClaims`. The two must agree or the
- * delegated run silently sees organization rows only.
- *
- * The gate, in order:
- *   - no delegation headers at all → the principal passes through untouched;
- *   - the caller is NOT the one configured delegator → `null`, i.e. REJECT the
- *     request. Silently ignoring the header would let any Access-authenticated
- *     human probe for delegation and learn whether it is enabled;
- *   - a delegator that names no subject → `null`, for the same reason.
- *
- * Only a service token may delegate: a human principal always carries an `email`,
- * so requiring an empty one means a browser session can never delegate even if it
- * somehow learned the delegator's id.
- *
- * Roles MIRROR the delegated human's real standing, so the agent reaches exactly
- * what that person reaches in a browser. Note the one asymmetry: Access `groups`
- * are not available to the delegator, so a delegated principal gets admin from the
- * email allowlist but never group-derived roles.
- *
- * Pure (no request, no IO) so it is unit-testable, like `principalFromAccessClaims`.
- */
-export const applyDelegatedSubject = (
-  principal: Principal,
-  config: CloudflareConfig,
-  delegated: DelegatedIdentity,
-): Principal | null => {
-  const subject = delegated.subject?.trim() ?? "";
-  const email = delegated.email?.trim() ?? "";
-  if (subject.length === 0 && email.length === 0) return principal;
-
-  const delegator = identityKey(config.accessDelegationCommonName ?? "");
-  const mayDelegate =
-    delegator.length > 0 && principal.email.length === 0 && principal.accountId === delegator;
-  if (!mayDelegate) return null;
-  if (subject.length === 0) return null;
-
-  const isAdmin = email.length > 0 && config.adminEmails.includes(email.toLowerCase());
-  return {
-    ...principal,
-    accountId: identityKey(subject),
-    email,
-    name: email.length > 0 ? email : subject,
-    roles: isAdmin ? ["admin"] : ["member"],
-    // Restated rather than left to the spread: `Principal` discriminates `orgRole`
-    // on `orgRoleModel`, so the spread alone leaves the union open and `orgRole`
-    // unassignable. This host only ever builds the "organization" arm.
-    orgRoleModel: "organization",
-    orgRole: isAdmin ? "admin" : "member",
-  };
-};
-
 const ACCESS_COOKIE = "CF_Authorization";
 
 const cookieValue = (header: string | null, name: string): string | null => {
@@ -158,15 +81,33 @@ const cookieValue = (header: string | null, name: string): string | null => {
   return null;
 };
 
+const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+
 /**
  * The Access JWT a request carries: the `Cf-Access-Jwt-Assertion` header Access
  * injects on paths it protects, else the `CF_Authorization` cookie it sets for
  * the whole hostname — which is what authenticates the browser UI on paths Access
  * does not front (API and MCP stay public so API keys can reach them).
+ *
+ * A cookie rides along on any cross-site request a browser makes, so a request
+ * authenticated by the cookie alone must also prove it came from this origin
+ * before it may change state: a same-origin `Origin`, or `Sec-Fetch-Site:
+ * same-origin`. A header credential is never attached by a browser on its own
+ * and needs no such proof.
  */
-export const accessTokenFromRequest = (request: Request): string | null =>
-  request.headers.get("Cf-Access-Jwt-Assertion") ||
-  cookieValue(request.headers.get("cookie"), ACCESS_COOKIE);
+export const accessTokenFromRequest = (request: Request): string | null => {
+  const header = request.headers.get("Cf-Access-Jwt-Assertion");
+  if (header) return header;
+  const cookie = cookieValue(request.headers.get("cookie"), ACCESS_COOKIE);
+  if (cookie === null) return null;
+  return SAFE_METHODS.has(request.method.toUpperCase()) || isSameOrigin(request) ? cookie : null;
+};
+
+const isSameOrigin = (request: Request): boolean => {
+  const origin = request.headers.get("origin");
+  if (origin !== null) return origin === new URL(request.url).origin;
+  return request.headers.get("sec-fetch-site") === "same-origin";
+};
 
 /** The principal API keys and the internal entrypoint act as: the admin identified
  *  by `apiKeyPrincipalEmail`, keyed on the email like the same person's browser session. */
@@ -215,20 +156,25 @@ export const makeAccessVerifier = (
 
   // Dev/single-user escape hatch: bypass Access entirely, every request is a
   // fixed admin. Only when explicitly enabled (and the instance is otherwise
-  // unprotected). Mirrors the local app's single-user model.
-  const devPrincipal: Principal = {
-    kind: "member",
-    accountId: "dev",
-    organizationId: config.organizationId,
-    organizationName: config.organizationName,
-    organizationSlug: config.organizationSlug,
-    email: config.adminEmails[0] ?? "dev@local",
-    name: "Dev",
-    avatarUrl: null,
-    roles: ["admin"],
-    orgRoleModel: "organization",
-    orgRole: "admin",
-  };
+  // unprotected). Mirrors the local app's single-user model. With an owner email
+  // configured, that admin IS the owner, the same account API keys and the
+  // internal entrypoint act as, so the local UI and a calling service share rows.
+  const devPrincipal: Principal =
+    config.apiKeyPrincipalEmail.length > 0
+      ? ownerPrincipal(config, "Dev")
+      : {
+          kind: "member",
+          accountId: "dev",
+          organizationId: config.organizationId,
+          organizationName: config.organizationName,
+          organizationSlug: config.organizationSlug,
+          email: config.adminEmails[0] ?? "dev@local",
+          name: "Dev",
+          avatarUrl: null,
+          roles: ["admin"],
+          orgRoleModel: "organization",
+          orgRole: "admin",
+        };
 
   const verifyApiKey = (key: string): Effect.Effect<Principal | null> =>
     Effect.promise(() => matchApiKey(key, config.apiKeys)).pipe(
@@ -247,13 +193,7 @@ export const makeAccessVerifier = (
       }).pipe(Effect.orElseSucceed(() => null));
       if (!verified) return null;
 
-      const principal = principalFromAccessClaims(
-        verified.payload as Record<string, unknown>,
-        config,
-      );
-      // Delegation runs AFTER verification, never instead of it: the caller is
-      // always a fully verified Access principal first.
-      return applyDelegatedSubject(principal, config, readDelegatedIdentity(request));
+      return principalFromAccessClaims(verified.payload as Record<string, unknown>, config);
     });
 
   const verify = (request: Request): Effect.Effect<Principal | null> =>

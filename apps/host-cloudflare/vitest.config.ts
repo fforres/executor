@@ -10,6 +10,7 @@ export default defineConfig({
   },
   test: {
     include: ["src/**/*.test.ts"],
+    setupFiles: ["./test-stubs/timing-safe-equal.ts"],
     passWithNoTests: true,
   },
 });

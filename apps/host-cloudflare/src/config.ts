@@ -43,13 +43,6 @@ export interface CloudflareEnv {
   readonly ACCESS_GROUPS_CLAIM?: string;
   /** Comma-separated emails granted the admin role. */
   readonly ADMIN_EMAILS?: string;
-  /**
-   * The `common_name` of the ONE Access service token allowed to act on behalf
-   * of another subject (see `applyDelegatedSubject`). Unset disables delegation
-   * entirely, which is the correct default: an instance with no headless agent
-   * in front of it should never accept a delegated subject.
-   */
-  readonly ACCESS_DELEGATION_COMMON_NAME?: string;
   /** The single organization id/name every authenticated user belongs to. */
   readonly SELF_HOSTED_ORG_ID?: string;
   readonly SELF_HOSTED_ORG_NAME?: string;
@@ -98,9 +91,6 @@ export interface CloudflareConfig {
   readonly accessNameClaim: string;
   readonly accessGroupsClaim: string;
   readonly adminEmails: readonly string[];
-  /** See {@link CloudflareEnv.ACCESS_DELEGATION_COMMON_NAME}. Optional so an
-   *  instance that never delegates carries no extra configuration. */
-  readonly accessDelegationCommonName?: string;
   readonly organizationId: string;
   readonly organizationName: string;
   /** URL slug for org-prefixed console paths (`/<slug>/policies`). */
@@ -161,7 +151,7 @@ const hasApiKeys = (env: CloudflareAccessEnv): boolean =>
  * both Access variables unset is a valid API-key-only deployment (the JWT path is
  * then disabled); setting only one of them is always an error.
  */
-export const missingCloudflareAccessVars = (env: CloudflareAccessEnv): readonly string[] => {
+const missingAccessVars = (env: CloudflareAccessEnv): readonly string[] => {
   if (env.ENABLE_DEV_AUTH === "true") return [];
   const accessTeamDomain = normalizeAccessTeamDomain(env.ACCESS_TEAM_DOMAIN);
   const accessAud = (env.ACCESS_AUD ?? "").trim();
@@ -180,41 +170,19 @@ export const missingCloudflareAccessVars = (env: CloudflareAccessEnv): readonly 
  * Dev auth makes every request a fixed admin, so it must never survive into a
  * deployment: an Access audience or `ENVIRONMENT=production` marks one.
  */
-export const devAuthInProductionError = (env: CloudflareAccessEnv): string | null => {
-  if (env.ENABLE_DEV_AUTH !== "true") return null;
-  const production =
-    (env.ENVIRONMENT ?? "").trim().toLowerCase() === "production" ||
-    (env.ACCESS_AUD ?? "").trim().length > 0;
-  return production
-    ? "ENABLE_DEV_AUTH is set on a production deployment (ACCESS_AUD or ENVIRONMENT=production is set). Refusing to serve requests; unset ENABLE_DEV_AUTH."
-    : null;
-};
-
-/** The first reason this environment must not serve requests, or null. */
-export const cloudflareConfigProblem = (env: CloudflareAccessEnv): string | null => {
-  const devAuth = devAuthInProductionError(env);
-  if (devAuth) return devAuth;
-  const missing = missingCloudflareAccessVars(env);
-  return missing.length > 0 ? cloudflareAccessConfigErrorMessage(missing) : null;
-};
-
-export const cloudflareAccessConfigErrorMessage = (missingVars: readonly string[]): string =>
-  `Cloudflare Access is not configured. Set ${missingVars.join(" and ")} before serving requests.`;
+const devAuthInProduction = (env: CloudflareAccessEnv): boolean =>
+  env.ENABLE_DEV_AUTH === "true" &&
+  ((env.ENVIRONMENT ?? "").trim().toLowerCase() === "production" ||
+    (env.ACCESS_AUD ?? "").trim().length > 0);
 
 // The org slug doubles as a URL segment (`/<slug>/policies`), so an
 // operator-set value must fit the shared grammar and avoid reserved root
 // segments — a colliding slug would shadow real routes (notably /api, /mcp,
 // and Cloudflare's /cdn-cgi).
-const resolveOrgSlug = (value: string | undefined): string => {
-  if (!value) return "default";
-  if (!isValidOrgSlug(value) && value !== "default") {
-    // oxlint-disable-next-line executor/no-try-catch-or-throw, executor/no-error-constructor -- boundary: a colliding org slug would shadow app routes; refuse to boot
-    throw new Error(
-      `SELF_HOSTED_ORG_SLUG ${JSON.stringify(value)} is not usable as a URL slug (2-48 chars of [a-z0-9-], not a reserved path segment like "api" or "mcp")`,
-    );
-  }
-  return value;
-};
+const orgSlugProblem = (value: string | undefined): string | null =>
+  value && !isValidOrgSlug(value) && value !== "default"
+    ? `SELF_HOSTED_ORG_SLUG ${JSON.stringify(value)} is not usable as a URL slug (2-48 chars of [a-z0-9-], not a reserved path segment like "api" or "mcp")`
+    : null;
 
 const resolveClef = (env: CloudflareConfigEnv): ClefConfig | undefined => {
   if (!env.AI) return undefined;
@@ -232,51 +200,51 @@ export interface LoadConfigOptions {
   readonly internal?: boolean;
 }
 
-/** Why the internal entrypoint cannot serve, or null. It acts as the single user,
- *  so that user's email must be configured. */
-export const internalConfigProblem = (env: CloudflareAccessEnv): string | null =>
-  devAuthInProductionError(env) ??
-  ((env.API_KEY_PRINCIPAL_EMAIL ?? "").includes("@")
-    ? null
-    : "API_KEY_PRINCIPAL_EMAIL must be set to the owner's email for the internal service-binding entrypoint.");
+export type LoadConfigResult =
+  | { readonly ok: true; readonly config: CloudflareConfig }
+  | { readonly ok: false; readonly message: string };
 
-export const loadConfig = (
+/**
+ * The single validator: every reason this environment must not serve requests is
+ * decided here, and nowhere else, as a message. `loadConfig` throws it; a caller
+ * that answers with it (the Worker's 503) reads the result.
+ */
+export const loadConfigResult = (
   env: CloudflareConfigEnv,
   options: LoadConfigOptions = {},
-): CloudflareConfig => {
+): LoadConfigResult => {
+  const refuse = (message: string): LoadConfigResult => ({ ok: false, message });
   const secretKey = env.EXECUTOR_SECRET_KEY?.trim();
   if (!secretKey || secretKey.length < 16) {
-    // oxlint-disable-next-line executor/no-try-catch-or-throw, executor/no-error-constructor -- boundary: the Worker must not boot without the at-rest secret key
-    throw new Error(
+    return refuse(
       "EXECUTOR_SECRET_KEY must be set (wrangler secret put EXECUTOR_SECRET_KEY) — it encrypts stored secrets at rest in D1",
     );
   }
-  const devAuthError = devAuthInProductionError(env);
-  if (devAuthError) {
-    // oxlint-disable-next-line executor/no-try-catch-or-throw, executor/no-error-constructor -- boundary: dev auth in production is a wide-open instance; refuse to boot
-    throw new Error(devAuthError);
+  if (devAuthInProduction(env)) {
+    return refuse(
+      "ENABLE_DEV_AUTH is set on a production deployment (ACCESS_AUD or ENVIRONMENT=production is set). Refusing to serve requests; unset ENABLE_DEV_AUTH.",
+    );
   }
   const enableDevAuth = env.ENABLE_DEV_AUTH === "true";
   const accessTeamDomain = normalizeAccessTeamDomain(env.ACCESS_TEAM_DOMAIN);
   const accessAud = (env.ACCESS_AUD ?? "").trim();
   const internal = options.internal === true;
-  const missingAccessVars = internal ? [] : missingCloudflareAccessVars(env);
-  if (missingAccessVars.length > 0) {
-    // oxlint-disable-next-line executor/no-try-catch-or-throw, executor/no-error-constructor -- boundary: production must fail closed without a valid Access verifier
-    throw new Error(cloudflareAccessConfigErrorMessage(missingAccessVars));
-  }
-  const apiKeys = parseApiKeyHashes(env.EXECUTOR_API_KEY_HASHES);
-  if (typeof apiKeys === "string") {
-    // oxlint-disable-next-line executor/no-try-catch-or-throw, executor/no-error-constructor -- boundary: a malformed key list must not silently disable or weaken auth
-    throw new Error(apiKeys);
-  }
-  const apiKeyPrincipalEmail = (env.API_KEY_PRINCIPAL_EMAIL ?? "").trim().toLowerCase();
-  if ((apiKeys.length > 0 || internal) && !apiKeyPrincipalEmail.includes("@")) {
-    // oxlint-disable-next-line executor/no-try-catch-or-throw, executor/no-error-constructor -- boundary: API keys need a principal to act as
-    throw new Error(
-      "API_KEY_PRINCIPAL_EMAIL must be set to an email when EXECUTOR_API_KEY_HASHES is configured or the internal entrypoint is used",
+  const missing = internal ? [] : missingAccessVars(env);
+  if (missing.length > 0) {
+    return refuse(
+      `Cloudflare Access is not configured. Set ${missing.join(" and ")} before serving requests.`,
     );
   }
+  const apiKeys = parseApiKeyHashes(env.EXECUTOR_API_KEY_HASHES);
+  if (typeof apiKeys === "string") return refuse(apiKeys);
+  const apiKeyPrincipalEmail = (env.API_KEY_PRINCIPAL_EMAIL ?? "").trim().toLowerCase();
+  if ((apiKeys.length > 0 || internal) && !apiKeyPrincipalEmail.includes("@")) {
+    return refuse(
+      "API_KEY_PRINCIPAL_EMAIL must be set to the owner's email when EXECUTOR_API_KEY_HASHES is configured or the internal service-binding entrypoint is used",
+    );
+  }
+  const slugProblem = orgSlugProblem(env.SELF_HOSTED_ORG_SLUG);
+  if (slugProblem !== null) return refuse(slugProblem);
   const webBaseUrl = resolvePublicOrigin({ explicit: env.VITE_PUBLIC_SITE_URL, env: {} });
   if (!webBaseUrl && !enableDevAuth && !warnedNoCloudflareOrigin) {
     warnedNoCloudflareOrigin = true;
@@ -287,16 +255,15 @@ export const loadConfig = (
       }),
     );
   }
-  return {
+  const config: CloudflareConfig = {
     accessTeamDomain,
     accessAud,
     accessNameClaim: env.ACCESS_NAME_CLAIM ?? "name",
     accessGroupsClaim: env.ACCESS_GROUPS_CLAIM ?? "groups",
     adminEmails: splitLower(env.ADMIN_EMAILS),
-    accessDelegationCommonName: env.ACCESS_DELEGATION_COMMON_NAME?.trim() || undefined,
     organizationId: env.SELF_HOSTED_ORG_ID ?? "default",
     organizationName: env.SELF_HOSTED_ORG_NAME ?? "Default",
-    organizationSlug: resolveOrgSlug(env.SELF_HOSTED_ORG_SLUG),
+    organizationSlug: env.SELF_HOSTED_ORG_SLUG || "default",
     secretKey,
     allowLocalNetwork: env.ALLOW_LOCAL_NETWORK === "true",
     // Pinned origin via the shared resolver. A Worker receives no PaaS platform
@@ -312,4 +279,16 @@ export const loadConfig = (
     apiKeys,
     apiKeyPrincipalEmail,
   };
+  return { ok: true, config };
+};
+
+/** {@link loadConfigResult}, refusing with an `Error` carrying its message. */
+export const loadConfig = (
+  env: CloudflareConfigEnv,
+  options: LoadConfigOptions = {},
+): CloudflareConfig => {
+  const result = loadConfigResult(env, options);
+  if (result.ok) return result.config;
+  // oxlint-disable-next-line executor/no-try-catch-or-throw, executor/no-error-constructor -- boundary: the Worker must not boot with an unsafe or incomplete configuration
+  throw new Error(result.message);
 };
