@@ -191,6 +191,51 @@ describe("makeClefToolDiscoveryProvider", () => {
     }),
   );
 
+  it.effect("answers a restricted search from a cached unfiltered ranking", () =>
+    Effect.gen(function* () {
+      const cache = makeClefRankingCache();
+      const { ai, requests } = fakeAi({
+        "linear.org.main.issues_list": 0.9,
+        "github.org.main.pulls_list": 0.8,
+        "slack.org.main.post": 0.7,
+      });
+      const provider = makeClefToolDiscoveryProvider({ clef: { ai }, subject: "me", cache });
+      const catalog = [
+        toolRow("slack", "post"),
+        toolRow("github", "pulls_list"),
+        toolRow("linear", "issues_list"),
+      ];
+      yield* provider.searchTools(input(catalog));
+      const restricted = yield* provider.searchTools({
+        ...input(catalog.filter((tool) => tool.integration !== "linear")),
+        integrations: ["github", "slack"],
+      });
+      expect(requests).toHaveLength(1);
+      expect(restricted.items.map((item) => item.path)).toEqual([
+        "github.org.main.pulls_list",
+        "slack.org.main.post",
+      ]);
+    }),
+  );
+
+  it.effect("ranks a restricted search once and caches it apart from other allow lists", () =>
+    Effect.gen(function* () {
+      const cache = makeClefRankingCache();
+      const { ai, requests } = fakeAi({
+        "github.org.main.pulls_list": 0.8,
+        "slack.org.main.post": 0.7,
+      });
+      const provider = makeClefToolDiscoveryProvider({ clef: { ai }, subject: "me", cache });
+      const github = [toolRow("github", "pulls_list")];
+      const slack = [toolRow("slack", "post")];
+      yield* provider.searchTools({ ...input(github), integrations: ["github"] });
+      yield* provider.searchTools({ ...input(github), integrations: ["github"] });
+      const other = yield* provider.searchTools({ ...input(slack), integrations: ["slack"] });
+      expect(requests).toHaveLength(2);
+      expect(other.items.map((item) => item.path)).toEqual(["slack.org.main.post"]);
+    }),
+  );
+
   it.effect("pages a cached ranking without asking Clef again", () =>
     Effect.gen(function* () {
       const cache = makeClefRankingCache();

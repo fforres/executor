@@ -433,10 +433,14 @@ export type ToolDiscoveryInput = {
    *  passthrough caller builds a filtered `tools.list` and has no whole
    *  `Executor` to hand over. */
   readonly executor: { readonly tools: Pick<Executor["tools"], "list"> };
-  /** Names the filter baked into `executor.tools.list` (integration, owner,
-   *  connection), so a provider that caches by query never serves one
-   *  filter's ranking to another. Absent when the catalog is unfiltered. */
+  /** Names the owner/connection filter baked into `executor.tools.list`, so a
+   *  provider that caches by query never serves one filter's ranking to another.
+   *  Absent when the catalog is unfiltered. */
   readonly scope?: string;
+  /** Exact integration slugs `executor.tools.list` is already restricted to
+   *  (sorted). A provider that caches rankings may answer from an unfiltered
+   *  ranking of the same query by keeping only these. Absent: no restriction. */
+  readonly integrations?: readonly string[];
   readonly query: string;
   readonly namespace?: string;
   readonly limit: number;

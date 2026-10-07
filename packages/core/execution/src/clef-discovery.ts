@@ -133,14 +133,29 @@ export const makeClefToolDiscoveryProvider = (
         }
 
         const namespace = input.namespace?.trim() ?? "";
-        const cacheKey = [options.subject, input.scope ?? "", namespace, query].join("\u0000");
+        // A ranking is cached per (subject, scope, query) over the unfiltered
+        // catalog, and per allowed-integration set when the list is restricted.
+        const baseKey = [options.subject, input.scope ?? "", namespace, query].join("\u0000");
+        const integrations = input.integrations;
+        const restrictedKey =
+          integrations === undefined ? undefined : `${baseKey}\u0000${integrations.join(",")}`;
+        const fromCache = (cached: CachedRanking, only?: ReadonlySet<string>) => {
+          const results =
+            only === undefined
+              ? cached.results
+              : cached.results.filter((result) => only.has(result.integration));
+          return { ...paginate(results, input.offset, input.limit), ranked: cached.ranked };
+        };
+        const unfiltered = integrations === undefined ? undefined : options.cache?.get(baseKey);
+        if (unfiltered !== undefined) {
+          yield* Effect.annotateCurrentSpan({ "executor.search.clef.cache_hit": true });
+          return fromCache(unfiltered, new Set(integrations));
+        }
+        const cacheKey = restrictedKey ?? baseKey;
         const cached = options.cache?.get(cacheKey);
         if (cached !== undefined) {
           yield* Effect.annotateCurrentSpan({ "executor.search.clef.cache_hit": true });
-          return {
-            ...paginate(cached.results, input.offset, input.limit),
-            ranked: cached.ranked,
-          };
+          return fromCache(cached);
         }
 
         const all = yield* input.executor.tools
