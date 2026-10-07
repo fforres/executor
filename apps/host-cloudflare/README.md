@@ -98,6 +98,36 @@ would redirect it away.
 `ENABLE_DEV_AUTH` is refused at boot (503) when `ACCESS_AUD` is set or
 `ENVIRONMENT=production`.
 
+## Three doors
+
+The same Worker is reachable three ways, and each resolves to a principal
+differently.
+
+1. **Public API-key door** (`/mcp`, `/api/*`, `/v1`, `/.well-known/*`). Agents
+   and MCP clients send `Authorization: Bearer exk_...` (or `x-api-key`). The key
+   is matched against the hashes in `EXECUTOR_API_KEY_HASHES` and acts as the
+   `API_KEY_PRINCIPAL_EMAIL` admin. Keep these paths out of the Access policy
+   (an Access Bypass application for them) so the worker alone gates them.
+2. **Access UI door** (everything else, mainly `/`). A browser goes through
+   Cloudflare Access; the Worker verifies the JWT from `Cf-Access-Jwt-Assertion`
+   or the hostname-wide `CF_Authorization` cookie, which is also what
+   authenticates the UI's own `/api` calls and `/api/oauth/callback`.
+3. **`ExecutorInternal` service-binding door.** Workers in the same Cloudflare
+   account call the Worker through a service binding with no credential and act
+   as the owner (`API_KEY_PRINCIPAL_EMAIL`). The entrypoint has no public route
+   and builds its own trusted app; nothing in a request or in `env` can turn the
+   public door into this mode. In the calling worker's `wrangler.jsonc`:
+
+   ```jsonc
+   "services": [
+     { "binding": "EXECUTOR", "service": "posse-executor", "entrypoint": "ExecutorInternal" }
+   ]
+   ```
+
+   Then `await env.EXECUTOR.searchTools({ query: "..." })` and
+   `await env.EXECUTOR.invokeTool({ ... })` (RPC, returning `{ status, body }`),
+   or `env.EXECUTOR.fetch(request)` for any other route.
+
 ## Local development
 
 ```bash
