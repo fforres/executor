@@ -32,10 +32,10 @@ const tool = (integration: string, name: string, extra: Partial<Tool> = {}): Too
 const CATALOG = [
   tool("linear", "issues_list", {
     inputSchema: { type: "object", properties: { team: { type: "string" } }, required: ["team"] },
-    annotations: { readOnlyHint: true },
+    annotations: { mayElicit: true },
   }),
   tool("github", "pulls_create", {
-    annotations: { requiresApproval: true, destructiveHint: true },
+    annotations: { requiresApproval: true, approvalDescription: "Opens a pull request" },
   }),
   tool("config", "static_tool", { static: true }),
 ];
@@ -72,7 +72,9 @@ describe("searchPassthroughTools", () => {
           searchTools: (input) =>
             Effect.gen(function* () {
               seen.push(input);
-              const all = yield* input.executor.tools.list({ includeAnnotations: false });
+              const all = yield* input.executor.tools
+                .list({ includeAnnotations: false })
+                .pipe(Effect.orDie);
               return {
                 items: all.map((item, index) => ({
                   path: String(item.address).replace(/^tools\./, ""),
@@ -101,11 +103,11 @@ describe("searchPassthroughTools", () => {
         ]);
         expect(result.items[0]).toMatchObject({
           inputSchema: { required: ["team"] },
-          annotations: { readOnlyHint: true },
+          annotations: { mayElicit: true },
         });
         expect(result.items[1]?.annotations).toEqual({
           requiresApproval: true,
-          destructiveHint: true,
+          approvalDescription: "Opens a pull request",
         });
       }),
   );
@@ -117,7 +119,9 @@ describe("searchPassthroughTools", () => {
         searchTools: (input) =>
           Effect.gen(function* () {
             scopes.push(input.scope);
-            const all = yield* input.executor.tools.list({ includeAnnotations: false });
+            const all = yield* input.executor.tools
+              .list({ includeAnnotations: false })
+              .pipe(Effect.orDie);
             return { items: [], total: all.length, hasMore: false, nextOffset: null };
           }),
       };
