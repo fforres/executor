@@ -78,15 +78,16 @@ import {
 import { MCP_ORG_WRITE_ACCESS_HEADER } from "./seams";
 import {
   CfWorkerJsonSchemaValidator,
+  PASSTHROUGH_SEARCH_LIMIT_DEFAULT,
+  PASSTHROUGH_SEARCH_LIMIT_MAX,
+  PASSTHROUGH_SEARCH_QUERY_MAX,
   resolvePassthroughTarget,
+  runPassthroughCall,
   searchPassthroughTools,
   type McpToolsPort,
+  type PassthroughCallResult,
 } from "./passthrough-api";
-import {
-  passthroughCallCode,
-  passthroughInstructions,
-  SEARCH_INVOKE_SKILL,
-} from "./passthrough-tools";
+import { passthroughInstructions, SEARCH_INVOKE_SKILL } from "./passthrough-tools";
 import type { McpToolMode } from "./browser-approval";
 
 // ---------------------------------------------------------------------------
@@ -699,23 +700,41 @@ const toMcpResult = (result: FormattedExecuteInput): McpToolResult => {
  * result, and a success unwraps to the tool's `data`. Everything else
  * (sandbox error, emitted output) keeps the codemode rendering.
  */
-const toPassthroughResult = (outcome: FormattedExecuteInput): McpToolResult => {
-  const value = outcome.result;
-  if (outcome.error || !isToolResult(value)) return toMcpResult(outcome);
-  if (value.ok) {
-    return toMcpResult({ ...outcome, result: value.data });
-  }
-  const message = `${value.error.code}: ${value.error.message}`;
-  return {
-    content: [{ type: "text", text: `Error: ${message}` }],
-    structuredContent: {
-      status: "error",
-      error: value.error,
-      logs: outcome.logs ?? [],
-    },
-    isError: true,
-  };
-};
+const toPassthroughResult = (address: ToolAddress, result: PassthroughCallResult): McpToolResult =>
+  Match.value(result).pipe(
+    Match.when({ status: "ok" }, (ok) =>
+      toMcpResult(
+        isToolResult(ok.outcome.result) ? { ...ok.outcome, result: ok.result } : ok.outcome,
+      ),
+    ),
+    // The client approved natively, so the policy prompt is always accepted.
+    Match.when({ status: "approval_required" }, (pending) => ({
+      content: [{ type: "text" as const, text: `Error: ${pending.message}` }],
+      isError: true,
+    })),
+    Match.when({ status: "input_required" }, (input) =>
+      elicitationUnsupportedResult(String(address), input.request),
+    ),
+    Match.when({ status: "blocked" }, (blocked) => toolErrorResult(blocked.error, [])),
+    Match.when({ status: "error" }, (failed) =>
+      failed.outcome.error || !isToolErrorLike(failed.error)
+        ? toMcpResult(failed.outcome)
+        : toolErrorResult(failed.error, failed.logs),
+    ),
+    Match.exhaustive,
+  );
+
+const isToolErrorLike = (value: unknown): value is { code: string; message: string } =>
+  isRecord(value) && typeof value.code === "string" && typeof value.message === "string";
+
+const toolErrorResult = (
+  failure: { readonly code: string; readonly message: string },
+  logs: readonly string[],
+): McpToolResult => ({
+  content: [{ type: "text", text: `Error: ${failure.code}: ${failure.message}` }],
+  structuredContent: { status: "error", error: failure, logs },
+  isError: true,
+});
 
 /**
  * A passthrough tool asked the user for something and the connected client
@@ -1352,7 +1371,7 @@ const registerPassthroughTools = <E extends Cause.YieldableError>(
               .string()
               .trim()
               .min(1)
-              .max(500)
+              .max(PASSTHROUGH_SEARCH_QUERY_MAX)
               .describe("Keywords describing the tool or task, such as github create issue."),
             integration: z
               .string()
@@ -1369,7 +1388,12 @@ const registerPassthroughTools = <E extends Cause.YieldableError>(
               .describe(
                 "Exact account name from integrations; pair with integration and owner to select one account.",
               ),
-            limit: z.number().int().min(1).max(20).default(10),
+            limit: z
+              .number()
+              .int()
+              .min(1)
+              .max(PASSTHROUGH_SEARCH_LIMIT_MAX)
+              .default(PASSTHROUGH_SEARCH_LIMIT_DEFAULT),
             offset: z.number().int().min(0).default(0),
           },
           annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
@@ -1918,36 +1942,26 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
           "mcp.tool.mode": "passthrough",
           "executor.tool.address": address,
         });
-        const { url: supportsUrl } = getElicitationSupport(server);
+        const { url: supportsUrl, form: supportsForm } = getElicitationSupport(server);
         const native = makeMcpElicitationHandler(server, extra.requestId, debugLog);
-        const { form: supportsForm } = getElicitationSupport(server);
-        // Set when the tool asked the user for something this client cannot
-        // relay. The handler has no error channel (a non-accept is a decline
-        // to the executor), so the request is kept here and the whole call is
-        // reported as unanswerable below — with what was asked, URL included —
-        // instead of as "declined by the user", which nobody did.
-        let unanswerable: ElicitationRequest | undefined;
-        const onElicitation: ElicitationHandler = (ctx) => {
-          // Every invoke is advertised as destructive, so the client's native
-          // approval covers the selected ID and arguments, even if policy changed.
-          // Tool-raised prompts still require their own response below.
-          if (ctx.source === "policy") {
-            return Effect.succeed({ action: "accept" as const, content: {} });
-          }
-          // Anything the tool itself asked for goes to the client natively
-          // when it can take it; the native bridge already turns a URL
-          // request into a form for form-only clients.
-          if (supportsForm || (supportsUrl && Predicate.isTagged(ctx.request, "UrlElicitation"))) {
-            return native(ctx);
-          }
-          unanswerable = ctx.request;
-          return Effect.succeed({ action: "decline" as const });
-        };
-        const outcome = yield* engine.execute(passthroughCallCode(address, args), {
-          onElicitation,
+        // Every invoke is advertised as destructive, so the client's native
+        // approval covers the selected ID and arguments, even if policy changed
+        // (`policyApproved`). Tool-raised prompts still need their own answer:
+        // natively when the client can take it (the bridge turns a URL request
+        // into a form for form-only clients), otherwise the call is reported as
+        // unanswerable with what was asked, URL included, instead of as
+        // "declined by the user", which nobody did.
+        const result = yield* runPassthroughCall({
+          engine,
+          address,
+          args,
+          policyApproved: true,
+          answerToolPrompt: (ctx) =>
+            supportsForm || (supportsUrl && Predicate.isTagged(ctx.request, "UrlElicitation"))
+              ? native(ctx)
+              : undefined,
         });
-        if (unanswerable) return elicitationUnsupportedResult(String(address), unanswerable);
-        return toPassthroughResult(outcome);
+        return toPassthroughResult(address, result);
       }).pipe(
         Effect.withSpan("mcp.host.tool.execute", {
           attributes: {
