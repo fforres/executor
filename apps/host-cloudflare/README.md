@@ -46,7 +46,7 @@ After the first deploy, API and MCP requests return 503 and name the missing
 Access variables until configuration is complete. In the Zero Trust dashboard:
 
 1. **Access → Applications → Add an application → Self-hosted**
-2. Application domain: `executor-cloudflare.<your-subdomain>.workers.dev`
+2. Application domain: `posse-executor.<your-subdomain>.workers.dev`
 3. Add an Access policy (e.g. _Emails ending in `@yourcompany.com`_)
 4. Copy the Application **Audience (AUD)** tag, then:
    ```bash

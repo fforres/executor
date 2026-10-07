@@ -3,7 +3,7 @@ import { HttpEffect, HttpRouter } from "effect/unstable/http";
 
 import { dbProviderLayer, ExecutorApp, textFailureStrategy } from "@executor-js/api/server";
 
-import { loadConfig, type CloudflareEnv } from "./config";
+import { loadConfig, type CloudflareConfig, type CloudflareEnv } from "./config";
 import { makeCloudflarePlugins } from "./plugins";
 import { createD1ExecutorDb } from "./db/d1";
 import { cloudflareAccessIdentityLayer } from "./auth/cloudflare-access";
@@ -33,8 +33,10 @@ import { preloadQuickJs } from "./quickjs";
 // so the providers close over it instead of reading process.env.
 // ===========================================================================
 
-export const makeCloudflareApp = async (env: CloudflareEnv) => {
-  const config = loadConfig(env);
+export const makeCloudflareApp = async (
+  env: CloudflareEnv,
+  config: CloudflareConfig = loadConfig(env),
+) => {
   const plugins = makeCloudflarePlugins(config.secretKey);
 
   // Load the Workers-compatible (WASM-inlined) QuickJS variant before any

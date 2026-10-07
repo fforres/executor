@@ -5,7 +5,7 @@ import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT } from "jose";
 import { McpAuthProvider } from "@executor-js/host-mcp";
 
 import { cloudflareAccessMcpAuth } from "../mcp/auth";
-import { loadConfig, type CloudflareConfig } from "../config";
+import { internalConfigProblem, loadConfig, type CloudflareConfig } from "../config";
 import { generateApiKey, hashApiKey } from "./api-keys";
 import { makeAccessVerifier } from "./cloudflare-access";
 
@@ -38,6 +38,7 @@ const config: CloudflareConfig = {
   secretKey: "x".repeat(32),
   allowLocalNetwork: false,
   enableDevAuth: false,
+  trustedInternal: false,
   apiKeys: [{ label: "posse", hash: await hashApiKey(apiKey) }],
   apiKeyPrincipalEmail: "owner@example.com",
 };
@@ -164,5 +165,63 @@ describe("dev auth in production", () => {
     expect(() => loadConfig({ ...base, ENVIRONMENT: "production" })).toThrowError(
       /ENABLE_DEV_AUTH is set on a production deployment/,
     );
+  });
+});
+
+describe("internal service-binding door", () => {
+  const env = {
+    EXECUTOR_SECRET_KEY: "test-secret-key-0123456789abcdef",
+    VITE_PUBLIC_SITE_URL: "https://executor.example.com",
+    ACCESS_TEAM_DOMAIN: TEAM,
+    ACCESS_AUD: AUD,
+    API_KEY_PRINCIPAL_EMAIL: "owner@example.com",
+  };
+  const internalConfig = loadConfig(env, { internal: true });
+  const publicConfig = loadConfig(env);
+
+  it("acts as the owner without any credential", async () => {
+    const principal = await Effect.runPromise(makeAccessVerifier(internalConfig).verify(request()));
+    expect(principal).toMatchObject({
+      accountId: "owner@example.com",
+      orgRole: "admin",
+      name: "Internal service binding",
+    });
+  });
+
+  it("resolves to the same account as an API key and a browser session", async () => {
+    const internal = await Effect.runPromise(makeAccessVerifier(internalConfig).verify(request()));
+    const viaKey = await verify({ authorization: `Bearer ${apiKey}` });
+    expect(internal?.accountId).toBe(viaKey?.accountId);
+  });
+
+  it("is never what the public config builds, whatever env or headers say", async () => {
+    expect(publicConfig.trustedInternal).toBe(false);
+    expect(loadConfig({ ...env, TRUSTED_INTERNAL: "true" } as typeof env).trustedInternal).toBe(
+      false,
+    );
+    const hostile = {
+      "x-executor-internal": "true",
+      "x-executor-subject": "owner@example.com",
+      "x-executor-subject-email": "owner@example.com",
+      "cf-connecting-ip": "127.0.0.1",
+      host: "executor.internal",
+    };
+    expect(
+      await Effect.runPromise(makeAccessVerifier(publicConfig, { jwks }).verify(request(hostile))),
+    ).toBeNull();
+  });
+
+  it("refuses to serve without the owner's email", () => {
+    expect(internalConfigProblem({})).toMatch(/API_KEY_PRINCIPAL_EMAIL/);
+    expect(internalConfigProblem({ API_KEY_PRINCIPAL_EMAIL: "owner@example.com" })).toBeNull();
+    expect(() =>
+      loadConfig({ ...env, API_KEY_PRINCIPAL_EMAIL: undefined }, { internal: true }),
+    ).toThrowError(/API_KEY_PRINCIPAL_EMAIL must be set/);
+  });
+
+  it("does not need Access configured", () => {
+    const { ACCESS_TEAM_DOMAIN: _team, ACCESS_AUD: _aud, ...noAccess } = env;
+    expect(loadConfig(noAccess, { internal: true }).trustedInternal).toBe(true);
+    expect(() => loadConfig(noAccess)).toThrowError(/Cloudflare Access is not configured/);
   });
 });

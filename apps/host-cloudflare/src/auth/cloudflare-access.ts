@@ -168,15 +168,16 @@ export const accessTokenFromRequest = (request: Request): string | null =>
   request.headers.get("Cf-Access-Jwt-Assertion") ||
   cookieValue(request.headers.get("cookie"), ACCESS_COOKIE);
 
-/** The principal an API key acts as: the admin identified by `apiKeyPrincipalEmail`. */
-export const apiKeyPrincipal = (config: CloudflareConfig, label: string): Principal => ({
+/** The principal API keys and the internal entrypoint act as: the admin identified
+ *  by `apiKeyPrincipalEmail`, keyed on the email like the same person's browser session. */
+export const ownerPrincipal = (config: CloudflareConfig, name: string): Principal => ({
   kind: "member",
   accountId: identityKey(config.apiKeyPrincipalEmail),
   organizationId: config.organizationId,
   organizationName: config.organizationName,
   organizationSlug: config.organizationSlug,
   email: config.apiKeyPrincipalEmail,
-  name: `API key ${label}`,
+  name,
   avatarUrl: null,
   roles: ["admin"],
   orgRoleModel: "organization",
@@ -231,7 +232,7 @@ export const makeAccessVerifier = (
 
   const verifyApiKey = (key: string): Effect.Effect<Principal | null> =>
     Effect.promise(() => matchApiKey(key, config.apiKeys)).pipe(
-      Effect.map((match) => (match ? apiKeyPrincipal(config, match.label) : null)),
+      Effect.map((match) => (match ? ownerPrincipal(config, `API key ${match.label}`) : null)),
     );
 
   const verifyAccess = (request: Request): Effect.Effect<Principal | null> =>
@@ -257,6 +258,10 @@ export const makeAccessVerifier = (
 
   const verify = (request: Request): Effect.Effect<Principal | null> =>
     Effect.gen(function* () {
+      // Only the `ExecutorInternal` service-binding entrypoint builds a config with
+      // this set; it is not read from `env` or the request, so no header or
+      // credential presented to the public `fetch` can reach this branch.
+      if (config.trustedInternal) return ownerPrincipal(config, "Internal service binding");
       if (config.enableDevAuth) return devPrincipal;
       const key = presentedApiKey(request.headers);
       if (key !== null) return yield* verifyApiKey(key);

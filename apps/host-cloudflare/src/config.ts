@@ -111,6 +111,13 @@ export interface CloudflareConfig {
    *  static URL — the per-request origin is used instead (see RequestWebOrigin). */
   readonly webBaseUrl?: string;
   readonly enableDevAuth: boolean;
+  /**
+   * True ONLY for the config the `ExecutorInternal` service-binding entrypoint
+   * builds (`loadConfig(env, { internal: true })`). Every request it serves acts
+   * as the single user without credentials. It is never derived from `env` or
+   * from a request, so the public `fetch` can never be in this mode.
+   */
+  readonly trustedInternal: boolean;
   /** Present only when the Workers AI binding is bound; absent leaves search lexical. */
   readonly clef?: ClefConfig;
   /** Accepted API keys (hash only). Empty disables API-key auth. */
@@ -219,7 +226,24 @@ const resolveClef = (env: CloudflareConfigEnv): ClefConfig | undefined => {
   };
 };
 
-export const loadConfig = (env: CloudflareConfigEnv): CloudflareConfig => {
+export interface LoadConfigOptions {
+  /** Build the trusted config for the service-binding entrypoint (see
+   *  {@link CloudflareConfig.trustedInternal}). Needs `API_KEY_PRINCIPAL_EMAIL`. */
+  readonly internal?: boolean;
+}
+
+/** Why the internal entrypoint cannot serve, or null. It acts as the single user,
+ *  so that user's email must be configured. */
+export const internalConfigProblem = (env: CloudflareAccessEnv): string | null =>
+  devAuthInProductionError(env) ??
+  ((env.API_KEY_PRINCIPAL_EMAIL ?? "").includes("@")
+    ? null
+    : "API_KEY_PRINCIPAL_EMAIL must be set to the owner's email for the internal service-binding entrypoint.");
+
+export const loadConfig = (
+  env: CloudflareConfigEnv,
+  options: LoadConfigOptions = {},
+): CloudflareConfig => {
   const secretKey = env.EXECUTOR_SECRET_KEY?.trim();
   if (!secretKey || secretKey.length < 16) {
     // oxlint-disable-next-line executor/no-try-catch-or-throw, executor/no-error-constructor -- boundary: the Worker must not boot without the at-rest secret key
@@ -235,7 +259,8 @@ export const loadConfig = (env: CloudflareConfigEnv): CloudflareConfig => {
   const enableDevAuth = env.ENABLE_DEV_AUTH === "true";
   const accessTeamDomain = normalizeAccessTeamDomain(env.ACCESS_TEAM_DOMAIN);
   const accessAud = (env.ACCESS_AUD ?? "").trim();
-  const missingAccessVars = missingCloudflareAccessVars(env);
+  const internal = options.internal === true;
+  const missingAccessVars = internal ? [] : missingCloudflareAccessVars(env);
   if (missingAccessVars.length > 0) {
     // oxlint-disable-next-line executor/no-try-catch-or-throw, executor/no-error-constructor -- boundary: production must fail closed without a valid Access verifier
     throw new Error(cloudflareAccessConfigErrorMessage(missingAccessVars));
@@ -246,10 +271,10 @@ export const loadConfig = (env: CloudflareConfigEnv): CloudflareConfig => {
     throw new Error(apiKeys);
   }
   const apiKeyPrincipalEmail = (env.API_KEY_PRINCIPAL_EMAIL ?? "").trim().toLowerCase();
-  if (apiKeys.length > 0 && !apiKeyPrincipalEmail.includes("@")) {
+  if ((apiKeys.length > 0 || internal) && !apiKeyPrincipalEmail.includes("@")) {
     // oxlint-disable-next-line executor/no-try-catch-or-throw, executor/no-error-constructor -- boundary: API keys need a principal to act as
     throw new Error(
-      "API_KEY_PRINCIPAL_EMAIL must be set to an email when EXECUTOR_API_KEY_HASHES is configured",
+      "API_KEY_PRINCIPAL_EMAIL must be set to an email when EXECUTOR_API_KEY_HASHES is configured or the internal entrypoint is used",
     );
   }
   const webBaseUrl = resolvePublicOrigin({ explicit: env.VITE_PUBLIC_SITE_URL, env: {} });
@@ -283,6 +308,7 @@ export const loadConfig = (env: CloudflareConfigEnv): CloudflareConfig => {
     webBaseUrl,
     enableDevAuth,
     clef: resolveClef(env),
+    trustedInternal: internal,
     apiKeys,
     apiKeyPrincipalEmail,
   };

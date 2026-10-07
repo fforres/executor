@@ -206,7 +206,7 @@ const writePreviewConfig = (worker: string, databaseName: string, databaseId: st
       fail(`wrangler.jsonc no longer matches ${pattern} — update preview.ts`);
     text = text.replace(pattern, replacement);
   };
-  substitute(/"name":\s*"executor-cloudflare"/, `"name": "${worker}"`);
+  substitute(/"name":\s*"posse-executor"/, `"name": "${worker}"`);
   substitute(/"database_name":\s*"[^"]*"/, `"database_name": "${databaseName}"`);
   substitute(/"database_id":\s*"[^"]*"/, `"database_id": "${databaseId}"`);
   substitute(/"bucket_name":\s*"[^"]*"/, `"bucket_name": "${SHARED_BLOBS_BUCKET}"`);

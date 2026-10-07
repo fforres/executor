@@ -77,7 +77,7 @@ cat <<'NEXT'
   dashboard:
 
     1. Access -> Applications -> Add an application -> Self-hosted
-    2. Application domain: executor-cloudflare.<your-subdomain>.workers.dev
+    2. Application domain: posse-executor.<your-subdomain>.workers.dev
     3. Add an Access policy (e.g. "Emails ending in @yourcompany.com")
     4. After saving, copy the Application Audience (AUD) tag, then set:
        bunx wrangler deploy --var ACCESS_AUD:<aud> \

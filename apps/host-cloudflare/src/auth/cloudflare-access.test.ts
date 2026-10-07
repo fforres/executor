@@ -19,6 +19,7 @@ const config: CloudflareConfig = {
   allowLocalNetwork: false,
   webBaseUrl: "https://localhost",
   enableDevAuth: false,
+  trustedInternal: false,
   apiKeys: [],
   apiKeyPrincipalEmail: "",
 };
