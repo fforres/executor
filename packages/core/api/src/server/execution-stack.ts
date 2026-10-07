@@ -30,8 +30,10 @@ import type { McpResource } from "@executor-js/host-mcp";
 import type { AnyPlugin, Executor, ExecutorConfig, StorageFailure } from "@executor-js/sdk";
 import {
   createExecutionEngine,
+  defaultToolDiscoveryProvider,
   type ExecutionEngine,
   type ExecutionEngineConfig,
+  type ToolDiscoveryProvider,
 } from "@executor-js/execution";
 
 import { DbProvider } from "./executor-fuma-db";
@@ -119,7 +121,13 @@ export const makeExecutionStack = <
     readonly orgWrites?: ExecutorConfig<TPlugins>["orgWrites"];
   },
 ): Effect.Effect<
-  { readonly executor: Executor<TPlugins>; readonly engine: ExecutionEngine<Cause.YieldableError> },
+  {
+    readonly executor: Executor<TPlugins>;
+    readonly engine: ExecutionEngine<Cause.YieldableError>;
+    /** The ranker behind the engine's `tools.search`, so a surface that searches
+     *  outside the engine (passthrough `search`) ranks the same way. */
+    readonly toolDiscoveryProvider: ToolDiscoveryProvider;
+  },
   StorageFailure,
   DbProvider | PluginsProvider | HostConfig | CodeExecutorProvider | EngineDecorator
 > =>
@@ -139,9 +147,12 @@ export const makeExecutionStack = <
     const { decorate } = yield* EngineDecorator.asEffect().pipe(
       Effect.withSpan("executor.stack.decorator"),
     );
+    const hostConfig = yield* HostConfig.asEffect();
+    const toolDiscoveryProvider =
+      hostConfig.toolDiscovery?.({ accountId, organizationId }) ?? defaultToolDiscoveryProvider;
     const engine = yield* Effect.sync(() =>
       decorate(
-        createExecutionEngine({ executor, codeExecutor }),
+        createExecutionEngine({ executor, codeExecutor, toolDiscoveryProvider }),
         {
           accountId,
           organizationId,
@@ -150,7 +161,7 @@ export const makeExecutionStack = <
         { mcpResource: options?.mcpResource },
       ),
     );
-    return { executor, engine };
+    return { executor, engine, toolDiscoveryProvider };
   }).pipe(Effect.withSpan("executor.stack.build"));
 
 // ---------------------------------------------------------------------------

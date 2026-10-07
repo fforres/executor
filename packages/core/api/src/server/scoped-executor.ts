@@ -34,6 +34,7 @@
 import { Context, Effect, Option } from "effect";
 
 import type { McpResource } from "@executor-js/host-mcp";
+import type { ToolDiscoveryProvider } from "@executor-js/execution";
 import {
   createExecutor,
   Subject,
@@ -64,6 +65,15 @@ export interface HostConfigShape {
    * production hosts leave it off. Drives `makeHostedHttpClientLayer`.
    */
   readonly allowLocalNetwork: boolean;
+  /**
+   * Builds the tool-search ranker for one acting subject. Absent leaves search
+   * on the built-in lexical ranker, the right default for a host with no
+   * semantic ranker. The subject lets a provider cache per person.
+   */
+  readonly toolDiscovery?: (subject: {
+    readonly accountId: string;
+    readonly organizationId: string;
+  }) => ToolDiscoveryProvider;
   /** Require TLS for public outbound requests from both execution and admin views. */
   readonly requireTls?: boolean;
   /**

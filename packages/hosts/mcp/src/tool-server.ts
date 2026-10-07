@@ -1,4 +1,3 @@
-import { reattachDefs } from "@executor-js/sdk/host-internal";
 import { Data, Duration, Effect, Match, Option, Predicate, Result, Schema } from "effect";
 import * as Cause from "effect/Cause";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -13,19 +12,11 @@ import {
   registerAppTool,
   RESOURCE_MIME_TYPE,
 } from "@modelcontextprotocol/ext-apps/server";
-import type {
-  jsonSchemaValidator,
-  JsonSchemaType,
-  JsonSchemaValidator,
-} from "@modelcontextprotocol/sdk/validation/types.js";
-import { Validator } from "@cfworker/json-schema";
 import * as z from "zod/v4";
 
 import {
   CurrentOrgWriteAccess,
   ToolAddress,
-  IntegrationSlug,
-  ConnectionName,
   parseToolAddress,
   isToolFile,
   isToolResult,
@@ -46,13 +37,11 @@ import type {
   ElicitationRequest,
   SaveArtifactInput,
   ToolFileValue,
-  Executor,
-  ToolSchemaView,
 } from "@executor-js/sdk";
 import type * as Tracer from "effect/Tracer";
 import {
   createExecutionEngine,
-  searchTools,
+  defaultToolDiscoveryProvider,
   formatExecuteResult,
   formatPausedExecution,
   formatTtlDuration,
@@ -65,6 +54,7 @@ import {
   type Skill,
   type ExecutionEngine,
   type ExecutionEngineConfig,
+  type ToolDiscoveryProvider,
   type ResumeResponse,
   type ExecutionResult,
   type PausedExecution,
@@ -87,29 +77,17 @@ import {
 } from "./artifact-bindings";
 import { MCP_ORG_WRITE_ACCESS_HEADER } from "./seams";
 import {
+  CfWorkerJsonSchemaValidator,
+  resolvePassthroughTarget,
+  searchPassthroughTools,
+  type McpToolsPort,
+} from "./passthrough-api";
+import {
   passthroughCallCode,
   passthroughInstructions,
   SEARCH_INVOKE_SKILL,
 } from "./passthrough-tools";
 import type { McpToolMode } from "./browser-approval";
-
-// ---------------------------------------------------------------------------
-// Workers-compatible JSON Schema validator (replaces Ajv which uses new Function())
-// ---------------------------------------------------------------------------
-
-class CfWorkerJsonSchemaValidator implements jsonSchemaValidator {
-  getValidator<T>(schema: JsonSchemaType): JsonSchemaValidator<T> {
-    const validator = new Validator(schema as Record<string, unknown>, "2020-12", false);
-    return (input: unknown) => {
-      const result = validator.validate(input);
-      if (result.valid) {
-        return { valid: true, data: input as T, errorMessage: undefined };
-      }
-      const errorMessage = result.errors.map((e) => `${e.instanceLocation}: ${e.error}`).join("; ");
-      return { valid: false, data: undefined, errorMessage };
-    };
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Config
@@ -211,6 +189,13 @@ type SharedMcpServerConfig = {
    * Invoke is marked destructive for client approval. Requires `tools`.
    */
   readonly mode?: McpToolMode;
+  /**
+   * Ranks passthrough `search`. Passed explicitly because a caller that supplies
+   * a prebuilt `engine` gives this server no way to reach the engine's own
+   * provider, and passthrough search must rank the same way codemode's
+   * `tools.search` does. Defaults to the lexical ranker.
+   */
+  readonly toolDiscoveryProvider?: ToolDiscoveryProvider;
   /**
    * The scoped executor's tool catalog, for passthrough mode. Structurally
    * satisfied by `executor.tools`. Hosts that never serve passthrough may
@@ -321,8 +306,7 @@ export type McpIntegrationsPort = {
   >;
 };
 
-/** The same list and schema APIs used by codemode discovery. */
-export type McpToolsPort = Pick<Executor["tools"], "list" | "schema">;
+export type { McpToolsPort };
 
 /** A passthrough session was requested but the host gave the factory no
  *  catalog to serve. A configuration defect, not a runtime condition. */
@@ -1254,13 +1238,6 @@ const parseJsonContent = (raw: string): Record<string, unknown> | undefined => {
 // Passthrough surface
 // ---------------------------------------------------------------------------
 
-/** Serialize one existing schema view as a self-contained MCP input schema. */
-const passthroughInputSchema = (view: ToolSchemaView): unknown =>
-  reattachDefs(
-    view.inputSchema ?? { type: "object", properties: {} },
-    new Map(Object.entries(view.schemaDefinitions ?? {})),
-  );
-
 /** Register discovery over the existing APIs, with no catalog work at connection time. */
 const registerPassthroughTools = <E extends Cause.YieldableError>(
   server: McpServer,
@@ -1272,6 +1249,10 @@ const registerPassthroughTools = <E extends Cause.YieldableError>(
     args: unknown,
     extra: McpRequestJoinKeys,
   ) => Effect.Effect<McpToolResult, E>,
+  /** Ranks `search`. Passed in because this function receives ports, not the
+   *  server config — and passthrough search must rank the same way codemode's
+   *  `tools.search` does. */
+  toolDiscoveryProvider: ToolDiscoveryProvider,
 ): Effect.Effect<void> =>
   Effect.gen(function* () {
     const context = yield* Effect.context<never>();
@@ -1396,48 +1377,14 @@ const registerPassthroughTools = <E extends Cause.YieldableError>(
         ({ query, integration, owner, connection, limit, offset }, extra) =>
           boundary(
             Effect.gen(function* () {
-              const discovery = {
-                tools: {
-                  list: (filter?: Parameters<McpToolsPort["list"]>[0]) =>
-                    tools
-                      .list({
-                        ...filter,
-                        ...(integration === undefined
-                          ? {}
-                          : { integration: IntegrationSlug.make(integration) }),
-                        ...(owner === undefined ? {} : { owner }),
-                        ...(connection === undefined
-                          ? {}
-                          : { connection: ConnectionName.make(connection) }),
-                      })
-                      .pipe(Effect.map((items) => items.filter((tool) => tool.static !== true))),
-                },
-              };
-              const page = yield* searchTools(discovery, query, limit, { offset });
-              const candidates = yield* Effect.forEach(
-                page.items,
-                (match) =>
-                  Effect.gen(function* () {
-                    const address = ToolAddress.make(`tools.${match.path}`);
-                    const identity = parseToolAddress(String(address));
-                    if (!identity) return null;
-                    const schema = yield* tools.schema(address);
-                    // Visibility can change between listing and schema lookup.
-                    if (!schema) return null;
-                    return {
-                      id: String(address),
-                      name: match.name,
-                      integration: identity.integration,
-                      owner: identity.owner,
-                      connection: identity.connection,
-                      description: match.description,
-                      inputSchema: passthroughInputSchema(schema),
-                      ...(schema.annotations ? { annotations: schema.annotations } : {}),
-                    };
-                  }),
-                { concurrency: 4 },
-              );
-              const result = { ...page, items: candidates.filter(Predicate.isNotNull) };
+              const result = yield* searchPassthroughTools(tools, toolDiscoveryProvider, {
+                query,
+                integration,
+                owner,
+                connection,
+                limit,
+                offset,
+              });
               return {
                 content: [{ type: "text" as const, text: JSON.stringify(result) }],
                 structuredContent: result,
@@ -1462,46 +1409,25 @@ const registerPassthroughTools = <E extends Cause.YieldableError>(
         ({ tool: id, arguments: args }, extra) =>
           boundary(
             Effect.gen(function* () {
-              const identity = parseToolAddress(id);
-              const unavailable = {
-                isError: true,
-                content: [
-                  {
-                    type: "text" as const,
-                    text: "Tool not found or blocked by policy. Search for an available tool.",
-                  },
-                ],
-              };
-              if (!identity) return unavailable;
-              const address = ToolAddress.make(id);
-              // Use the existing visibility filter and exclude static configuration tools.
-              const visible = yield* tools.list({
-                integration: identity.integration,
-                owner: identity.owner,
-                connection: identity.connection,
-                query: String(identity.tool),
-                includeAnnotations: false,
-              });
-              if (!visible.some((tool) => tool.static !== true && tool.address === address))
-                return unavailable;
-              const schema = yield* tools.schema(address);
-              if (!schema) return unavailable;
-              // The SDK validator checks this dynamic JSON schema at the MCP boundary.
-              const validate = validator.getValidator<unknown>(
-                passthroughInputSchema(schema) as JsonSchemaType,
-              );
-              const checked = validate(args);
-              if (!checked.valid)
+              const target = yield* resolvePassthroughTarget(tools, validator, id, args);
+              if (target.status === "unavailable") {
                 return {
                   isError: true,
                   content: [
                     {
                       type: "text" as const,
-                      text: `Invalid arguments for tool ${id}: ${checked.errorMessage ?? "invalid"}`,
+                      text: "Tool not found or blocked by policy. Search for an available tool.",
                     },
                   ],
                 };
-              return yield* run(address, checked.data, extra);
+              }
+              if (target.status === "invalid_arguments") {
+                return {
+                  isError: true,
+                  content: [{ type: "text" as const, text: target.message }],
+                };
+              }
+              return yield* run(target.address, target.args, extra);
             }),
             extra,
           ),
@@ -2043,6 +1969,7 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
         config.connections,
         config.integrations,
         executePassthroughCall,
+        config.toolDiscoveryProvider ?? defaultToolDiscoveryProvider,
       );
     }
 

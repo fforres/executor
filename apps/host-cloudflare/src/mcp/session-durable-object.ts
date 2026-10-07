@@ -147,7 +147,7 @@ export class McpSessionDO extends McpAgentSessionDOBase<CloudflareEnv, CfSession
       // QuickJS-WASM must be loaded before the executor layer builds it (the
       // default variant can't fetch its .wasm on Workers). Idempotent per isolate.
       yield* Effect.promise(() => preloadQuickJs());
-      const { engine, executor } = yield* makeExecutionStack(
+      const { engine, executor, toolDiscoveryProvider } = yield* makeExecutionStack(
         sessionMeta.userId,
         sessionMeta.organizationId,
         sessionMeta.organizationName,
@@ -168,6 +168,9 @@ export class McpSessionDO extends McpAgentSessionDOBase<CloudflareEnv, CfSession
         connections: executor.connections,
         tools: executor.tools,
         integrations: executor.integrations,
+        // Same ranker as the engine's `tools.search`, so passthrough `search`
+        // and codemode rank identically.
+        toolDiscoveryProvider,
         // Artifacts are on by default, opt-out per connection. A session
         // persisted without a value restores to the default, same as a fresh
         // connection whose URL says nothing about `?artifacts=`.

@@ -65,12 +65,21 @@
     { "tag": "v1", "new_sqlite_classes": ["McpSessionDO"] },
     { "tag": "v2", "new_sqlite_classes": ["McpExecutionOwnerDirectoryDO"] },
   ],
+  // Workers AI. Tool search ranks with Cloudflare Clef through this binding
+  // (`env.AI.run`); the AI Gateway's OpenAI-compatible path drops Clef's
+  // `answers`, so it is not used. Remove the binding to fall back to lexical
+  // search. Workers AI has no local simulator: `wrangler dev` calls it remotely.
+  "ai": { "binding": "AI" },
   // Cloudflare Access is the entire auth layer. ACCESS_TEAM_DOMAIN, ACCESS_AUD,
   // and ADMIN_EMAILS are installation-specific live vars, set after the first
   // deploy and preserved by keep_vars. EXECUTOR_SECRET_KEY (the at-rest
   // secret-encryption key) is a SECRET, set it with
   // `wrangler secret put EXECUTOR_SECRET_KEY`, never in vars.
   "vars": {
+    // Optional, set per installation (preserved by keep_vars):
+    //   CLEF_GATEWAY_ID  an existing AI Gateway id the Clef calls are logged
+    //                    through; a gateway that does not exist fails the call.
+    //   CLEF_MODEL       `@cf/cloudflare/clef-flash` (default) or `@cf/cloudflare/clef`.
     "ACCESS_NAME_CLAIM": "name",
     "ACCESS_GROUPS_CLAIM": "groups",
     // Never preserve a production dev-auth override through keep_vars.

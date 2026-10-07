@@ -429,17 +429,31 @@ export type ExecutorIntegrationListItem = {
 };
 
 export type ToolDiscoveryInput = {
-  readonly executor: Executor;
+  /** Only the tool catalog, matching what `searchTools` itself reads: a
+   *  passthrough caller builds a filtered `tools.list` and has no whole
+   *  `Executor` to hand over. */
+  readonly executor: { readonly tools: Pick<Executor["tools"], "list"> };
+  /** Names the filter baked into `executor.tools.list` (integration, owner,
+   *  connection), so a provider that caches by query never serves one
+   *  filter's ranking to another. Absent when the catalog is unfiltered. */
+  readonly scope?: string;
   readonly query: string;
   readonly namespace?: string;
   readonly limit: number;
   readonly offset: number;
 };
 
+/** A ranked page. `ranked` is `false` when a provider that normally ranks by
+ *  meaning fell back (wholly or for part of the catalog) to lexical matching;
+ *  absent for providers that only ever match lexically. */
+export type ToolDiscoveryPage = PagedResult<ToolDiscoveryResult> & {
+  readonly ranked?: boolean;
+};
+
 export interface ToolDiscoveryProvider {
   readonly searchTools: (
     input: ToolDiscoveryInput,
-  ) => Effect.Effect<PagedResult<ToolDiscoveryResult>, ExecutionToolError>;
+  ) => Effect.Effect<ToolDiscoveryPage, ExecutionToolError>;
 }
 
 /**
@@ -462,7 +476,9 @@ export type PagedResult<T> = {
   readonly nextOffset: number | null;
 };
 
-const paginate = <T>(all: readonly T[], offset: number, limit: number): PagedResult<T> => {
+/** Slice a ranked list into a page. Exported so another discovery provider pages
+ *  identically. */
+export const paginate = <T>(all: readonly T[], offset: number, limit: number): PagedResult<T> => {
   const total = all.length;
   const start = Math.min(Math.max(offset, 0), total);
   const items = all.slice(start, start + limit);
@@ -478,14 +494,14 @@ const paginate = <T>(all: readonly T[], offset: number, limit: number): PagedRes
 
 /** What `searchTools` ranks over — the sandbox-callable path plus the v2
  *  identity fields a query can match against. */
-type SearchableTool = {
+export type SearchableTool = {
   readonly path: string;
   readonly integration: string;
   readonly name: string;
   readonly description?: string;
 };
 
-const toSearchableTool = (tool: Tool): SearchableTool => ({
+export const toSearchableTool = (tool: Tool): SearchableTool => ({
   path: addressToPath(String(tool.address)),
   integration: String(tool.integration),
   name: String(tool.name),
@@ -582,7 +598,7 @@ const scorePreparedField = (
   };
 };
 
-const matchesNamespace = (tool: SearchableTool, namespace?: string): boolean => {
+export const matchesNamespace = (tool: SearchableTool, namespace?: string): boolean => {
   if (!namespace || normalizeSearchText(namespace).length === 0) {
     return true;
   }
@@ -601,7 +617,7 @@ const matchesNamespace = (tool: SearchableTool, namespace?: string): boolean => 
   return isPrefixMatch(integrationTokens) || isPrefixMatch(pathTokens);
 };
 
-const scoreToolMatch = (tool: SearchableTool, query: string): ToolDiscoveryResult | null => {
+export const scoreToolMatch = (tool: SearchableTool, query: string): ToolDiscoveryResult | null => {
   const normalizedQuery = normalizeSearchText(query);
   const queryTokens = tokenizeSearchText(query);
 

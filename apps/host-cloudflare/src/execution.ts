@@ -10,6 +10,11 @@ import {
   PluginsProvider,
   type ExecutorDbHandle,
 } from "@executor-js/api/server";
+import {
+  makeClefRankingCache,
+  makeClefToolDiscoveryProvider,
+  type ToolDiscoveryProvider,
+} from "@executor-js/execution";
 import { makeDynamicWorkerExecutor } from "@executor-js/runtime-dynamic-worker";
 import { makeQuickJsExecutor } from "@executor-js/runtime-quickjs";
 import { env } from "cloudflare:workers";
@@ -51,11 +56,30 @@ export const makeCloudflarePluginsProvider = (
       }),
   });
 
+// One ranking cache per isolate, shared by every request's provider (the cache
+// key carries the subject).
+const clefRankingCache = makeClefRankingCache();
+
+/**
+ * The tool-search ranker for one acting subject: Clef when the Workers AI
+ * binding is bound, lexical (flagged `ranked: false`) otherwise.
+ */
+export const makeCloudflareToolDiscovery = (
+  config: CloudflareConfig,
+  subject: { readonly accountId: string; readonly organizationId: string },
+): ToolDiscoveryProvider =>
+  makeClefToolDiscoveryProvider({
+    clef: config.clef,
+    subject: `${subject.organizationId}\u0000${subject.accountId}`,
+    cache: clefRankingCache,
+  });
+
 export const makeCloudflareHostConfig = (config: CloudflareConfig): Layer.Layer<HostConfig> =>
   Layer.succeed(HostConfig)({
     allowLocalNetwork: config.allowLocalNetwork,
     webBaseUrl: config.webBaseUrl,
     oauthCallbackPath: "/api/oauth/callback",
+    toolDiscovery: (subject) => makeCloudflareToolDiscovery(config, subject),
   });
 
 /**

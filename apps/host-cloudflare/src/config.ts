@@ -3,6 +3,7 @@ import type { D1Database, DurableObjectNamespace, R2Bucket } from "@cloudflare/w
 import { isValidOrgSlug } from "@executor-js/api";
 import { missingPublicOriginWarning, resolvePublicOrigin } from "@executor-js/sdk/public-origin";
 
+import { CLEF_FLASH_MODEL, type ClefAiBinding, type ClefConfig } from "@executor-js/execution";
 import { parseApiKeyHashes, type ApiKeyHash } from "./auth/api-keys";
 
 let warnedNoCloudflareOrigin = false;
@@ -65,6 +66,15 @@ export interface CloudflareEnv {
    * behind Access, or the instance is wide open.
    */
   readonly ENABLE_DEV_AUTH?: string;
+  /**
+   * Workers AI binding (wrangler `ai`). Tool search ranks with Cloudflare Clef
+   * through it; absent, search stays lexical and says it was not ranked.
+   */
+  readonly AI?: ClefAiBinding;
+  /** AI Gateway id the Clef calls are logged through (optional, for logs). */
+  readonly CLEF_GATEWAY_ID?: string;
+  /** Clef model: `@cf/cloudflare/clef-flash` (default) or `@cf/cloudflare/clef`. */
+  readonly CLEF_MODEL?: string;
   /** Marks a deployed environment. `production` makes `ENABLE_DEV_AUTH` a boot error. */
   readonly ENVIRONMENT?: string;
   /**
@@ -101,6 +111,8 @@ export interface CloudflareConfig {
    *  static URL — the per-request origin is used instead (see RequestWebOrigin). */
   readonly webBaseUrl?: string;
   readonly enableDevAuth: boolean;
+  /** Present only when the Workers AI binding is bound; absent leaves search lexical. */
+  readonly clef?: ClefConfig;
   /** Accepted API keys (hash only). Empty disables API-key auth. */
   readonly apiKeys: readonly ApiKeyHash[];
   /** The principal every API key acts as. Set whenever `apiKeys` is non-empty. */
@@ -197,6 +209,16 @@ const resolveOrgSlug = (value: string | undefined): string => {
   return value;
 };
 
+const resolveClef = (env: CloudflareConfigEnv): ClefConfig | undefined => {
+  if (!env.AI) return undefined;
+  const gatewayId = env.CLEF_GATEWAY_ID?.trim();
+  return {
+    ai: env.AI,
+    model: env.CLEF_MODEL?.trim() || CLEF_FLASH_MODEL,
+    ...(gatewayId ? { gatewayId } : {}),
+  };
+};
+
 export const loadConfig = (env: CloudflareConfigEnv): CloudflareConfig => {
   const secretKey = env.EXECUTOR_SECRET_KEY?.trim();
   if (!secretKey || secretKey.length < 16) {
@@ -260,6 +282,7 @@ export const loadConfig = (env: CloudflareConfigEnv): CloudflareConfig => {
     // mirroring self-host (gated on enableDevAuth = local `wrangler dev`).
     webBaseUrl,
     enableDevAuth,
+    clef: resolveClef(env),
     apiKeys,
     apiKeyPrincipalEmail,
   };
