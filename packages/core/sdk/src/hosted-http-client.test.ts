@@ -5,8 +5,10 @@ import { HttpClient, HttpClientRequest } from "effect/unstable/http";
 
 import {
   type HostedHostnameResolver,
+  isInternalHostname,
   makeHostedFetch,
   makeHostedHttpClientLayer,
+  normalizeHostname,
   validateHostedOutboundUrl,
 } from "./hosted-http-client";
 
@@ -398,6 +400,20 @@ describe("hosted TLS policy", () => {
   });
 });
 
+describe("internal hostnames", () => {
+  it("normalises case and one trailing dot", () => {
+    expect(normalizeHostname("Tools.Internal.")).toBe("tools.internal");
+    expect(normalizeHostname("tools.internal")).toBe("tools.internal");
+  });
+
+  it("recognises *.internal hosts only", () => {
+    expect(isInternalHostname("TOOLS.internal.")).toBe(true);
+    expect(isInternalHostname("a.b.internal")).toBe(true);
+    expect(isInternalHostname("internal.example.com")).toBe(false);
+    expect(isInternalHostname("notinternal")).toBe(false);
+  });
+});
+
 describe("internal host routing", () => {
   const recordingFetcher = () => {
     const seen: Array<{ url: string; method: string; header: string | null; body: string }> = [];
@@ -483,6 +499,34 @@ describe("internal host routing", () => {
     expect(binding.seen.map((call) => call.url)).toEqual([
       "https://tools.internal/.well-known/oauth-authorization-server",
     ]);
+    expect(external.urls).toEqual([]);
+  });
+
+  it("hands the binding a manual-redirect request and returns its redirect untouched", async () => {
+    const seen: string[] = [];
+    const binding = {
+      fetch: async (request: Request) => {
+        seen.push(request.redirect);
+        return new Response(null, {
+          status: 302,
+          headers: { location: "https://elsewhere.example/loot" },
+        });
+      },
+    };
+    const external = externalStub();
+    const hostedFetch = makeHostedFetch({
+      fetch: external.fetch,
+      resolveHostname: publicResolver,
+      internalHosts: { "tools.internal": binding },
+    });
+
+    const response = await hostedFetch("https://tools.internal/mcp/websearch", {
+      redirect: "follow",
+    });
+
+    expect(seen).toEqual(["manual"]);
+    expect(response.status).toBe(302);
+    expect(response.headers.get("location")).toBe("https://elsewhere.example/loot");
     expect(external.urls).toEqual([]);
   });
 

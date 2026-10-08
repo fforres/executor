@@ -31,8 +31,10 @@
 
 export {
   HostedOutboundRequestBlocked,
+  isInternalHostname,
   makeHostedFetch,
   makeHostedHttpClientLayer,
+  normalizeHostname,
   spanRedactedHeaderNames,
   type HostedHttpClientOptions,
   type HostedInternalFetcher,

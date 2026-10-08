@@ -1,7 +1,12 @@
 import type { D1Database, DurableObjectNamespace, R2Bucket } from "@cloudflare/workers-types";
 
 import { isValidOrgSlug } from "@executor-js/api";
-import type { HostedInternalFetcher, HostedInternalHosts } from "@executor-js/sdk/host-internal";
+import {
+  isInternalHostname,
+  normalizeHostname,
+  type HostedInternalFetcher,
+  type HostedInternalHosts,
+} from "@executor-js/sdk/host-internal";
 import { missingPublicOriginWarning, resolvePublicOrigin } from "@executor-js/sdk/public-origin";
 
 import { CLEF_FLASH_MODEL, type ClefAiBinding, type ClefConfig } from "@executor-js/execution";
@@ -204,9 +209,9 @@ const resolveInternalHosts = (
     const entry = pair.trim();
     if (entry.length === 0) continue;
     const [rawHost, rawBinding, ...rest] = entry.split("=").map((part) => part.trim());
-    const host = (rawHost ?? "").toLowerCase();
+    const host = normalizeHostname(rawHost ?? "");
     const binding = rawBinding ?? "";
-    if (rest.length > 0 || !host.endsWith(".internal") || binding.length === 0) {
+    if (rest.length > 0 || !isInternalHostname(host) || binding.length === 0) {
       return {
         problem: `INTERNAL_MCP_HOSTS entry ${JSON.stringify(entry)} must look like "tools.internal=TOOLS" (a host ending in .internal, then a service binding name)`,
       };

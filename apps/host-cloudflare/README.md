@@ -166,8 +166,19 @@ fetch (OAuth discovery, probes, `/.well-known/*`; the bound Worker should answer
 404 for paths it does not serve). The match is on the exact hostname, outside the
 SSRF guard. Every other host takes the guarded path unchanged, any other
 `*.internal` host is refused, and an external server redirecting to an internal
-host stays blocked. A host naming a missing binding fails config load (503).
-Both the Worker and `McpSessionDO` read the same config, so both paths route.
+host stays blocked. Requests to a binding go out with `redirect: "manual"`, so a
+redirect answered by the bound Worker reaches the caller as is and is never
+followed. A host naming a missing binding fails config load (503). Both the
+Worker and `McpSessionDO` read the same config, so both paths route.
+
+**Trust boundary.** The boundary is the Cloudflare account, not Executor: any
+Worker in the same account could bind the target Worker, so the bound Worker
+must be private (no public route, `workers_dev` and preview URLs off) and
+Executor is its only intended caller. Hosts match exactly (`tools.internal`, not
+`x.tools.internal`), and a redirect from an external server into `*.internal` is
+refused. Because an integration pointing at an internal host reaches code that
+skips the SSRF guard, only admins should create such integrations, never
+end users.
 
 ## Local development
 

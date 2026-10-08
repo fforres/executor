@@ -168,6 +168,12 @@ describe("INTERNAL_MCP_HOSTS", () => {
     });
   });
 
+  it("accepts a trailing dot on the host and stores it normalised", () => {
+    const config = loadConfig(devEnv({ INTERNAL_MCP_HOSTS: "Tools.Internal.=TOOLS", TOOLS }));
+
+    expect(Object.keys(config.internalHosts)).toEqual(["tools.internal"]);
+  });
+
   it("refuses a host that does not end in .internal", () => {
     expect(
       loadConfigResult(devEnv({ INTERNAL_MCP_HOSTS: "api.example.com=TOOLS", TOOLS })),

@@ -239,8 +239,13 @@ const INTERNAL_SUFFIX = ".internal";
 const hasInternalHosts = (options: HostedHttpClientOptions): boolean =>
   Object.keys(options.internalHosts ?? {}).length > 0;
 
-const isInternalHostname = (hostname: string): boolean =>
-  hostname.toLowerCase().replace(/\.$/, "").endsWith(INTERNAL_SUFFIX);
+/** Lowercase, without a trailing dot: the form `internalHosts` keys are matched in. */
+export const normalizeHostname = (hostname: string): string =>
+  hostname.toLowerCase().replace(/\.$/, "");
+
+/** True for any `*.internal` host, whether or not a binding is configured for it. */
+export const isInternalHostname = (hostname: string): boolean =>
+  normalizeHostname(hostname).endsWith(INTERNAL_SUFFIX);
 
 const guardFetch = (
   underlying: typeof globalThis.fetch,
@@ -301,8 +306,10 @@ const routeInternalHosts = (
   const hosts = options.internalHosts ?? {};
   if (!hasInternalHosts(options)) return guarded;
   return (async (input, init) => {
-    const request = new Request(input, init);
-    const hostname = new URL(request.url).hostname.toLowerCase().replace(/\.$/, "");
+    // `manual`: a 3xx from the bound Worker comes back to the caller as is. The
+    // runtime would otherwise follow its `Location` outside the SSRF guard.
+    const request = new Request(input, { ...init, redirect: "manual" });
+    const hostname = normalizeHostname(new URL(request.url).hostname);
     const target = Object.hasOwn(hosts, hostname) ? hosts[hostname] : undefined;
     if (target) return await target.fetch(request);
     if (isInternalHostname(hostname)) {
