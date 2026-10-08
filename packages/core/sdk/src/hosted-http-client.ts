@@ -18,7 +18,22 @@ export type HostedHostnameResolver = (
   hostname: string,
 ) => Promise<ReadonlyArray<HostedResolvedAddress>>;
 
+/** A Workers service binding (or anything shaped like one). */
+export interface HostedInternalFetcher {
+  readonly fetch: (request: Request) => Promise<Response>;
+}
+
+/** Exact lowercase hostname to the fetcher that serves it, e.g. `tools.internal`. */
+export type HostedInternalHosts = Readonly<Record<string, HostedInternalFetcher>>;
+
 export interface HostedHttpClientOptions {
+  /**
+   * Private hosts served by a service binding instead of the network. A request
+   * whose hostname matches exactly goes to the fetcher, outside the SSRF guard;
+   * any other `*.internal` host is rejected, and the guard refuses redirects into
+   * one. Empty or absent leaves routing off.
+   */
+  readonly internalHosts?: HostedInternalHosts;
   readonly allowLocalNetwork?: boolean;
   /** Require HTTPS, except private addresses explicitly allowed for local development. */
   readonly requireTls?: boolean;
@@ -219,6 +234,14 @@ const stripCredentialHeaders = (init: RequestInit | undefined): RequestInit => {
   return { ...init, headers };
 };
 
+const INTERNAL_SUFFIX = ".internal";
+
+const hasInternalHosts = (options: HostedHttpClientOptions): boolean =>
+  Object.keys(options.internalHosts ?? {}).length > 0;
+
+const isInternalHostname = (hostname: string): boolean =>
+  hostname.toLowerCase().replace(/\.$/, "").endsWith(INTERNAL_SUFFIX);
+
 const guardFetch = (
   underlying: typeof globalThis.fetch,
   options: HostedHttpClientOptions,
@@ -233,6 +256,16 @@ const guardFetch = (
     let currentInit = init;
     for (let redirects = 0; redirects <= maxRedirects; redirects++) {
       const url = current instanceof Request ? current.url : String(current);
+      if (hasInternalHosts(options) && isInternalHostname(new URL(url).hostname)) {
+        await Effect.runPromise(
+          Effect.fail(
+            new HostedOutboundRequestBlocked({
+              url,
+              reason: "Internal hosts are only reachable directly, not through a redirect",
+            }),
+          ),
+        );
+      }
       await Effect.runPromise(validateHostedOutboundUrl(url, guardOptions));
       const response = await underlying(current, {
         ...currentInit,
@@ -259,9 +292,39 @@ const guardFetch = (
     return await underlying(current, { ...currentInit, redirect: "manual" });
   }) as typeof globalThis.fetch;
 
+// The router sits OUTSIDE the guard: a configured internal host goes straight to
+// its binding, everything else takes the guarded path unchanged.
+const routeInternalHosts = (
+  guarded: typeof globalThis.fetch,
+  options: HostedHttpClientOptions,
+): typeof globalThis.fetch => {
+  const hosts = options.internalHosts ?? {};
+  if (!hasInternalHosts(options)) return guarded;
+  return (async (input, init) => {
+    const request = new Request(input, init);
+    const hostname = new URL(request.url).hostname.toLowerCase().replace(/\.$/, "");
+    const target = Object.hasOwn(hosts, hostname) ? hosts[hostname] : undefined;
+    if (target) return await target.fetch(request);
+    if (isInternalHostname(hostname)) {
+      return await Effect.runPromise(
+        Effect.fail(
+          new HostedOutboundRequestBlocked({
+            url: request.url,
+            reason: `No internal binding is configured for host ${hostname}`,
+          }),
+        ),
+      );
+    }
+    return await guarded(request);
+  }) as typeof globalThis.fetch;
+};
+
 export const makeHostedFetch = (options: HostedHttpClientOptions = {}): typeof globalThis.fetch =>
-  // oxlint-disable-next-line executor/no-raw-fetch -- boundary: exposes a guarded Fetch API adapter for libraries that require fetch
-  guardFetch(options.fetch ?? globalThis.fetch, options);
+  routeInternalHosts(
+    // oxlint-disable-next-line executor/no-raw-fetch -- boundary: exposes a guarded Fetch API adapter for libraries that require fetch
+    guardFetch(options.fetch ?? globalThis.fetch, options),
+    options,
+  );
 
 // ---------------------------------------------------------------------------
 // Span header redaction.
@@ -336,11 +399,13 @@ export const makeHostedHttpClientLayer = (
     Layer.provide(FetchHttpClient.layer),
     Layer.provide(
       options.fetch
-        ? Layer.succeed(FetchHttpClient.Fetch)(guardFetch(options.fetch, options))
+        ? Layer.succeed(FetchHttpClient.Fetch)(
+            routeInternalHosts(guardFetch(options.fetch, options), options),
+          )
         : Layer.effect(
             FetchHttpClient.Fetch,
             Effect.map(Effect.service(FetchHttpClient.Fetch), (underlying) =>
-              guardFetch(underlying, options),
+              routeInternalHosts(guardFetch(underlying, options), options),
             ),
           ),
     ),

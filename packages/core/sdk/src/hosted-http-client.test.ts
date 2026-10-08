@@ -397,3 +397,167 @@ describe("hosted TLS policy", () => {
     expect(calls).toBe(1);
   });
 });
+
+describe("internal host routing", () => {
+  const recordingFetcher = () => {
+    const seen: Array<{ url: string; method: string; header: string | null; body: string }> = [];
+    return {
+      seen,
+      fetch: async (request: Request) => {
+        seen.push({
+          url: request.url,
+          method: request.method,
+          header: request.headers.get("x-probe"),
+          body: await request.text(),
+        });
+        return new Response("from-binding", { status: 200 });
+      },
+    };
+  };
+
+  const externalStub = () => {
+    const urls: string[] = [];
+    const fetch = (async (input) => {
+      const url = input instanceof Request ? input.url : String(input);
+      urls.push(url);
+      if (url === "https://evil.example/start") {
+        return new Response(null, {
+          status: 302,
+          headers: { location: "https://tools.internal/mcp/websearch" },
+        });
+      }
+      return new Response("from-network", { status: 200 });
+    }) as typeof globalThis.fetch;
+    return { urls, fetch };
+  };
+
+  it.effect("sends an internal host through the HTTP client to its binding", () =>
+    Effect.gen(function* () {
+      const binding = recordingFetcher();
+      const external = externalStub();
+      const response = yield* Effect.gen(function* () {
+        const client = yield* HttpClient.HttpClient;
+        return yield* client.execute(
+          HttpClientRequest.post("https://tools.internal/mcp/websearch").pipe(
+            HttpClientRequest.setHeader("x-probe", "abc"),
+            HttpClientRequest.bodyText('{"jsonrpc":"2.0"}', "application/json"),
+          ),
+        );
+      }).pipe(
+        Effect.provide(
+          makeHostedHttpClientLayer({
+            fetch: external.fetch,
+            resolveHostname: publicResolver,
+            internalHosts: { "tools.internal": binding },
+          }),
+        ),
+      );
+
+      expect(yield* response.text).toBe("from-binding");
+      expect(binding.seen).toEqual([
+        {
+          url: "https://tools.internal/mcp/websearch",
+          method: "POST",
+          header: "abc",
+          body: '{"jsonrpc":"2.0"}',
+        },
+      ]);
+      expect(external.urls).toEqual([]);
+    }),
+  );
+
+  it("sends an internal host through the plain fetch to its binding", async () => {
+    const binding = recordingFetcher();
+    const external = externalStub();
+    const hostedFetch = makeHostedFetch({
+      fetch: external.fetch,
+      resolveHostname: publicResolver,
+      internalHosts: { "tools.internal": binding },
+    });
+
+    const response = await hostedFetch(
+      "https://tools.internal/.well-known/oauth-authorization-server",
+    );
+
+    expect(await response.text()).toBe("from-binding");
+    expect(binding.seen.map((call) => call.url)).toEqual([
+      "https://tools.internal/.well-known/oauth-authorization-server",
+    ]);
+    expect(external.urls).toEqual([]);
+  });
+
+  it("sends an external host through the guarded fetch", async () => {
+    const binding = recordingFetcher();
+    const external = externalStub();
+    const hostedFetch = makeHostedFetch({
+      fetch: external.fetch,
+      resolveHostname: publicResolver,
+      internalHosts: { "tools.internal": binding },
+    });
+
+    const response = await hostedFetch("https://api.example/openapi.json");
+
+    expect(await response.text()).toBe("from-network");
+    expect(external.urls).toEqual(["https://api.example/openapi.json"]);
+    expect(binding.seen).toEqual([]);
+  });
+
+  it("still blocks a private address for an external host", async () => {
+    const external = externalStub();
+    const hostedFetch = makeHostedFetch({
+      fetch: external.fetch,
+      internalHosts: { "tools.internal": recordingFetcher() },
+    });
+
+    await expect(hostedFetch("http://127.0.0.1:3000/mcp")).rejects.toMatchObject({
+      _tag: "HostedOutboundRequestBlocked",
+    });
+    expect(external.urls).toEqual([]);
+  });
+
+  it("rejects an external redirect into an internal host", async () => {
+    const binding = recordingFetcher();
+    const external = externalStub();
+    const hostedFetch = makeHostedFetch({
+      fetch: external.fetch,
+      resolveHostname: publicResolver,
+      internalHosts: { "tools.internal": binding },
+    });
+
+    await expect(hostedFetch("https://evil.example/start")).rejects.toMatchObject({
+      _tag: "HostedOutboundRequestBlocked",
+    });
+    expect(external.urls).toEqual(["https://evil.example/start"]);
+    expect(binding.seen).toEqual([]);
+  });
+
+  it("rejects an internal host with no binding, naming the host", async () => {
+    const external = externalStub();
+    const hostedFetch = makeHostedFetch({
+      fetch: external.fetch,
+      resolveHostname: publicResolver,
+      internalHosts: { "tools.internal": recordingFetcher() },
+    });
+
+    await expect(hostedFetch("https://other.internal/mcp")).rejects.toMatchObject({
+      _tag: "HostedOutboundRequestBlocked",
+      reason: "No internal binding is configured for host other.internal",
+    });
+    expect(external.urls).toEqual([]);
+  });
+
+  it("matches the host exactly, not by suffix", async () => {
+    const binding = recordingFetcher();
+    const external = externalStub();
+    const hostedFetch = makeHostedFetch({
+      fetch: external.fetch,
+      resolveHostname: publicResolver,
+      internalHosts: { "tools.internal": binding },
+    });
+
+    await expect(hostedFetch("https://x.tools.internal/mcp")).rejects.toMatchObject({
+      _tag: "HostedOutboundRequestBlocked",
+    });
+    expect(binding.seen).toEqual([]);
+  });
+});

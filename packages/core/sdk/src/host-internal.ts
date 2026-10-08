@@ -35,6 +35,8 @@ export {
   makeHostedHttpClientLayer,
   spanRedactedHeaderNames,
   type HostedHttpClientOptions,
+  type HostedInternalFetcher,
+  type HostedInternalHosts,
 } from "./hosted-http-client";
 
 export {
