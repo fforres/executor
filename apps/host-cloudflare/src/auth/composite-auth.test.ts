@@ -37,6 +37,7 @@ const config: CloudflareConfig = {
   organizationSlug: "default",
   secretKey: "x".repeat(32),
   allowLocalNetwork: false,
+  internalHosts: {},
   enableDevAuth: false,
   trustedInternal: false,
   apiKeys: [{ label: "posse", hash: await hashApiKey(apiKey) }],

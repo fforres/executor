@@ -70,6 +70,11 @@
   // `answers`, so it is not used. Remove the binding to fall back to lexical
   // search. Workers AI has no local simulator: `wrangler dev` calls it remotely.
   "ai": { "binding": "AI" },
+  // Private MCP servers live in other Workers and are reached over service
+  // bindings, never the internet. INTERNAL_MCP_HOSTS maps a host to one of these
+  // bindings: an MCP integration at https://tools.internal/mcp/<tool> is served by
+  // env.TOOLS.fetch(...). `wrangler dev` reaches the service through the dev registry.
+  "services": [{ "binding": "TOOLS", "service": "posse-tools", "entrypoint": "ToolsMcp" }],
   // Cloudflare Access is the entire auth layer. ACCESS_TEAM_DOMAIN, ACCESS_AUD,
   // and ADMIN_EMAILS are installation-specific live vars, set after the first
   // deploy and preserved by keep_vars. EXECUTOR_SECRET_KEY (the at-rest
@@ -84,6 +89,7 @@
     "ACCESS_GROUPS_CLAIM": "groups",
     // Never preserve a production dev-auth override through keep_vars.
     "ENABLE_DEV_AUTH": "false",
+    "INTERNAL_MCP_HOSTS": "tools.internal=TOOLS",
     "SELF_HOSTED_ORG_ID": "default",
     "SELF_HOSTED_ORG_NAME": "Default",
     // VITE_PUBLIC_SITE_URL is intentionally unset: with no static URL the worker

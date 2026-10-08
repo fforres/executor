@@ -77,6 +77,7 @@ export const makeCloudflareToolDiscovery = (
 export const makeCloudflareHostConfig = (config: CloudflareConfig): Layer.Layer<HostConfig> =>
   Layer.succeed(HostConfig)({
     allowLocalNetwork: config.allowLocalNetwork,
+    internalHosts: config.internalHosts,
     webBaseUrl: config.webBaseUrl,
     oauthCallbackPath: "/api/oauth/callback",
     toolDiscovery: (subject) => makeCloudflareToolDiscovery(config, subject),

@@ -148,6 +148,27 @@ description?, toolCount }], toolCount }`, without the built-in `executor`
    The public door serves the same three as `POST /api/tools/search`,
    `POST /api/tools/invoke` and `GET /api/tools/overview`.
 
+### Internal tools over service bindings
+
+The doors above are inbound. Outbound, a private MCP server in another Worker is
+reached over a service binding, never the internet. `INTERNAL_MCP_HOSTS` is a
+comma-separated list of `host=BINDING` pairs (host ends in `.internal`), and each
+BINDING is a service binding on this Worker:
+
+```jsonc
+"services": [{ "binding": "TOOLS", "service": "posse-tools", "entrypoint": "ToolsMcp" }],
+"vars": { "INTERNAL_MCP_HOSTS": "tools.internal=TOOLS" }
+```
+
+An MCP integration with endpoint `https://tools.internal/mcp/websearch` is then
+served by `env.TOOLS.fetch(request)`, for the MCP transport and for the plain
+fetch (OAuth discovery, probes, `/.well-known/*`; the bound Worker should answer
+404 for paths it does not serve). The match is on the exact hostname, outside the
+SSRF guard. Every other host takes the guarded path unchanged, any other
+`*.internal` host is refused, and an external server redirecting to an internal
+host stays blocked. A host naming a missing binding fails config load (503).
+Both the Worker and `McpSessionDO` read the same config, so both paths route.
+
 ## Local development
 
 ```bash

@@ -15,6 +15,7 @@ const config: CloudflareConfig = {
   organizationSlug: "default",
   secretKey: "x".repeat(32),
   allowLocalNetwork: false,
+  internalHosts: {},
   webBaseUrl: "https://localhost",
   enableDevAuth: false,
   trustedInternal: false,

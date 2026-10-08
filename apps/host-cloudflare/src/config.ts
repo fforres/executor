@@ -1,6 +1,7 @@
 import type { D1Database, DurableObjectNamespace, R2Bucket } from "@cloudflare/workers-types";
 
 import { isValidOrgSlug } from "@executor-js/api";
+import type { HostedInternalFetcher, HostedInternalHosts } from "@executor-js/sdk/host-internal";
 import { missingPublicOriginWarning, resolvePublicOrigin } from "@executor-js/sdk/public-origin";
 
 import { CLEF_FLASH_MODEL, type ClefAiBinding, type ClefConfig } from "@executor-js/execution";
@@ -51,6 +52,14 @@ export interface CloudflareEnv {
   /** At-rest secret-encryption key (a `wrangler secret`, NOT a var). */
   readonly EXECUTOR_SECRET_KEY?: string;
   readonly ALLOW_LOCAL_NETWORK?: string;
+  /**
+   * Private MCP hosts served by service bindings: comma-separated `host=BINDING`
+   * pairs, e.g. `tools.internal=TOOLS`. Each BINDING names a service binding on
+   * this Worker (wrangler `services`).
+   */
+  readonly INTERNAL_MCP_HOSTS?: string;
+  /** Service binding for `tools.internal` (posse-tools, entrypoint ToolsMcp). */
+  readonly TOOLS?: HostedInternalFetcher;
   readonly VITE_PUBLIC_SITE_URL?: string;
   /**
    * Dev/single-user escape hatch: when "true", skip Cloudflare Access entirely
@@ -97,6 +106,8 @@ export interface CloudflareConfig {
   readonly organizationSlug: string;
   readonly secretKey: string;
   readonly allowLocalNetwork: boolean;
+  /** Internal MCP hosts mapped to their service bindings (see `INTERNAL_MCP_HOSTS`). */
+  readonly internalHosts: HostedInternalHosts;
   /** Explicit web base URL (`VITE_PUBLIC_SITE_URL`). Unset on a Worker with no
    *  static URL — the per-request origin is used instead (see RequestWebOrigin). */
   readonly webBaseUrl?: string;
@@ -184,6 +195,39 @@ const orgSlugProblem = (value: string | undefined): string | null =>
     ? `SELF_HOSTED_ORG_SLUG ${JSON.stringify(value)} is not usable as a URL slug (2-48 chars of [a-z0-9-], not a reserved path segment like "api" or "mcp")`
     : null;
 
+/** `host=BINDING` pairs to host→fetcher, or the message naming the bad pair. */
+const resolveInternalHosts = (
+  env: CloudflareConfigEnv,
+): { readonly hosts: HostedInternalHosts } | { readonly problem: string } => {
+  const hosts: Record<string, HostedInternalFetcher> = {};
+  for (const pair of (env.INTERNAL_MCP_HOSTS ?? "").split(",")) {
+    const entry = pair.trim();
+    if (entry.length === 0) continue;
+    const [rawHost, rawBinding, ...rest] = entry.split("=").map((part) => part.trim());
+    const host = (rawHost ?? "").toLowerCase();
+    const binding = rawBinding ?? "";
+    if (rest.length > 0 || !host.endsWith(".internal") || binding.length === 0) {
+      return {
+        problem: `INTERNAL_MCP_HOSTS entry ${JSON.stringify(entry)} must look like "tools.internal=TOOLS" (a host ending in .internal, then a service binding name)`,
+      };
+    }
+    const fetcher: unknown = Reflect.get(env, binding);
+    if (!isInternalFetcher(fetcher)) {
+      return {
+        problem: `INTERNAL_MCP_HOSTS maps ${host} to ${binding}, but no service binding named ${binding} is configured`,
+      };
+    }
+    hosts[host] = fetcher;
+  }
+  return { hosts };
+};
+
+const isInternalFetcher = (value: unknown): value is HostedInternalFetcher =>
+  typeof value === "object" &&
+  value !== null &&
+  "fetch" in value &&
+  typeof value.fetch === "function";
+
 const resolveClef = (env: CloudflareConfigEnv): ClefConfig | undefined => {
   if (!env.AI) return undefined;
   const gatewayId = env.CLEF_GATEWAY_ID?.trim();
@@ -243,6 +287,8 @@ export const loadConfigResult = (
       "API_KEY_PRINCIPAL_EMAIL must be set to the owner's email when EXECUTOR_API_KEY_HASHES is configured or the internal service-binding entrypoint is used",
     );
   }
+  const internalHosts = resolveInternalHosts(env);
+  if ("problem" in internalHosts) return refuse(internalHosts.problem);
   const slugProblem = orgSlugProblem(env.SELF_HOSTED_ORG_SLUG);
   if (slugProblem !== null) return refuse(slugProblem);
   const webBaseUrl = resolvePublicOrigin({ explicit: env.VITE_PUBLIC_SITE_URL, env: {} });
@@ -266,6 +312,7 @@ export const loadConfigResult = (
     organizationSlug: env.SELF_HOSTED_ORG_SLUG || "default",
     secretKey,
     allowLocalNetwork: env.ALLOW_LOCAL_NETWORK === "true",
+    internalHosts: internalHosts.hosts,
     // Pinned origin via the shared resolver. A Worker receives no PaaS platform
     // vars (env: {} — there is nothing to detect), so only the explicit
     // VITE_PUBLIC_SITE_URL applies; when it's unset we leave webBaseUrl undefined

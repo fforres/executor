@@ -143,3 +143,48 @@ describe("Cloudflare deployment configuration", () => {
     expect(config.vars).toHaveProperty("ENABLE_DEV_AUTH", "false");
   });
 });
+
+describe("INTERNAL_MCP_HOSTS", () => {
+  const TOOLS = { fetch: async () => new Response("ok") };
+  const devEnv = (overrides: Partial<ConfigEnv>) =>
+    makeEnv({ ENABLE_DEV_AUTH: "true", ...overrides });
+
+  it("resolves a host to the service binding it names", () => {
+    const config = loadConfig(devEnv({ INTERNAL_MCP_HOSTS: "Tools.Internal=TOOLS", TOOLS }));
+
+    expect(Object.keys(config.internalHosts)).toEqual(["tools.internal"]);
+    expect(config.internalHosts["tools.internal"]).toBe(TOOLS);
+  });
+
+  it("has no internal hosts when the variable is unset", () => {
+    expect(loadConfig(devEnv({ TOOLS })).internalHosts).toEqual({});
+  });
+
+  it("refuses a host whose binding is missing", () => {
+    expect(loadConfigResult(devEnv({ INTERNAL_MCP_HOSTS: "tools.internal=TOOLS" }))).toEqual({
+      ok: false,
+      message:
+        "INTERNAL_MCP_HOSTS maps tools.internal to TOOLS, but no service binding named TOOLS is configured",
+    });
+  });
+
+  it("refuses a host that does not end in .internal", () => {
+    expect(
+      loadConfigResult(devEnv({ INTERNAL_MCP_HOSTS: "api.example.com=TOOLS", TOOLS })),
+    ).toMatchObject({
+      ok: false,
+    });
+  });
+
+  it("declares the TOOLS binding and host in wrangler.jsonc", () => {
+    const config = parse(readFileSync(new URL("../wrangler.jsonc", import.meta.url), "utf8")) as {
+      readonly services?: readonly Record<string, string>[];
+      readonly vars?: Readonly<Record<string, unknown>>;
+    };
+
+    expect(config.services).toEqual([
+      { binding: "TOOLS", service: "posse-tools", entrypoint: "ToolsMcp" },
+    ]);
+    expect(config.vars).toHaveProperty("INTERNAL_MCP_HOSTS", "tools.internal=TOOLS");
+  });
+});
