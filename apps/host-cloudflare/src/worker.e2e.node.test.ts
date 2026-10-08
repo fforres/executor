@@ -21,6 +21,10 @@ import { microsoftCatalog } from "@executor-js/plugin-openapi/providers/microsof
 // ---------------------------------------------------------------------------
 
 const dir = fileURLToPath(new URL(".", import.meta.url));
+// wrangler loads `.dev.vars` next to the config only when `envFiles` is empty; a non-empty list
+// that names no existing file makes the worker see exactly the `vars` each test passes, never a
+// developer's local `.dev.vars` (which enables dev auth and sets a principal).
+const HERMETIC_ENV_FILES = [".e2e-no-env-file"];
 const runId = randomUUID().slice(0, 8);
 
 const ensureStaticAssets = () => {
@@ -100,6 +104,7 @@ describe("cloudflare host e2e (workerd/miniflare)", () => {
       ip: "127.0.0.1",
       local: true,
       persist: false,
+      envFiles: HERMETIC_ENV_FILES,
       experimental: { disableExperimentalWarning: true },
       vars: {
         EXECUTOR_SECRET_KEY: "test-secret-key-0123456789abcdef",
@@ -628,6 +633,7 @@ describe("cloudflare host configuration errors", () => {
       ip: "127.0.0.1",
       local: true,
       persist: false,
+      envFiles: HERMETIC_ENV_FILES,
       experimental: { disableExperimentalWarning: true },
       vars: {
         EXECUTOR_SECRET_KEY: "test-secret-key-0123456789abcdef",
@@ -663,6 +669,7 @@ describe("cloudflare host composite auth and REST tools (workerd/miniflare)", ()
       ip: "127.0.0.1",
       local: true,
       persist: false,
+      envFiles: HERMETIC_ENV_FILES,
       experimental: { disableExperimentalWarning: true },
       vars: {
         EXECUTOR_SECRET_KEY: "test-secret-key-0123456789abcdef",
