@@ -12,6 +12,8 @@ export interface ToolAnnotations {
   readonly requiresApproval?: boolean;
   readonly approvalDescription?: string;
   readonly mayElicit?: boolean;
+  /** Longest one call may run, in ms, when the plugin knows it (MCP: `_meta["posse/maxDurationMs"]`). */
+  readonly maxDurationMs?: number;
 }
 
 /** A tool as produced by a plugin — the definition, no address yet (the SDK

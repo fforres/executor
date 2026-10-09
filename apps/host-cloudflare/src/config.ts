@@ -10,6 +10,7 @@ import {
 import { missingPublicOriginWarning, resolvePublicOrigin } from "@executor-js/sdk/public-origin";
 
 import { CLEF_FLASH_MODEL, type ClefAiBinding, type ClefConfig } from "@executor-js/execution";
+import { parseActiveWorkTimeoutMs } from "@executor-js/plugin-mcp";
 import { parseApiKeyHashes, type ApiKeyHash } from "./auth/api-keys";
 
 let warnedNoCloudflareOrigin = false;
@@ -63,6 +64,12 @@ export interface CloudflareEnv {
    * this Worker (wrangler `services`).
    */
   readonly INTERNAL_MCP_HOSTS?: string;
+  /**
+   * Default active-work deadline for one MCP tool call, in ms (default 15
+   * minutes, capped at 90). A tool can declare its own up to that cap through
+   * `_meta["posse/maxDurationMs"]`.
+   */
+  readonly MCP_ACTIVE_WORK_TIMEOUT_MS?: string;
   /** Service binding for `tools.internal` (posse-tools, entrypoint ToolsMcp). */
   readonly TOOLS?: HostedInternalFetcher;
   readonly VITE_PUBLIC_SITE_URL?: string;
@@ -113,6 +120,8 @@ export interface CloudflareConfig {
   readonly allowLocalNetwork: boolean;
   /** Internal MCP hosts mapped to their service bindings (see `INTERNAL_MCP_HOSTS`). */
   readonly internalHosts: HostedInternalHosts;
+  /** Default MCP tool-call deadline in ms (`MCP_ACTIVE_WORK_TIMEOUT_MS`); undefined means the plugin default. */
+  readonly mcpActiveWorkTimeoutMs?: number;
   /** Explicit web base URL (`VITE_PUBLIC_SITE_URL`). Unset on a Worker with no
    *  static URL — the per-request origin is used instead (see RequestWebOrigin). */
   readonly webBaseUrl?: string;
@@ -318,6 +327,7 @@ export const loadConfigResult = (
     secretKey,
     allowLocalNetwork: env.ALLOW_LOCAL_NETWORK === "true",
     internalHosts: internalHosts.hosts,
+    mcpActiveWorkTimeoutMs: parseActiveWorkTimeoutMs(env.MCP_ACTIVE_WORK_TIMEOUT_MS),
     // Pinned origin via the shared resolver. A Worker receives no PaaS platform
     // vars (env: {} — there is nothing to detect), so only the explicit
     // VITE_PUBLIC_SITE_URL applies; when it's unset we leave webBaseUrl undefined

@@ -194,3 +194,27 @@ describe("INTERNAL_MCP_HOSTS", () => {
     expect(config.vars).toHaveProperty("INTERNAL_MCP_HOSTS", "tools.internal=TOOLS");
   });
 });
+
+describe("MCP_ACTIVE_WORK_TIMEOUT_MS", () => {
+  const devEnv = (overrides: Partial<ConfigEnv>) =>
+    makeEnv({ ENABLE_DEV_AUTH: "true", ...overrides });
+
+  it("leaves the plugin default when unset", () => {
+    expect(loadConfig(devEnv({})).mcpActiveWorkTimeoutMs).toBeUndefined();
+  });
+
+  it("reads a value in milliseconds", () => {
+    expect(
+      loadConfig(devEnv({ MCP_ACTIVE_WORK_TIMEOUT_MS: "1200000" })).mcpActiveWorkTimeoutMs,
+    ).toBe(1_200_000);
+  });
+
+  it("caps a value above 90 minutes and ignores garbage", () => {
+    expect(
+      loadConfig(devEnv({ MCP_ACTIVE_WORK_TIMEOUT_MS: "99999999999" })).mcpActiveWorkTimeoutMs,
+    ).toBe(5_400_000);
+    expect(
+      loadConfig(devEnv({ MCP_ACTIVE_WORK_TIMEOUT_MS: "soon" })).mcpActiveWorkTimeoutMs,
+    ).toBeUndefined();
+  });
+});

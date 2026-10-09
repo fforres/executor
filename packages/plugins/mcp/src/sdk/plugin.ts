@@ -53,7 +53,12 @@ import {
   McpOAuthReauthorizationRequired,
   McpToolDiscoveryError,
 } from "./errors";
-import { invokeMcpTool, isUnknownToolMessage } from "./invoke";
+import {
+  declaredMaxDurationMs,
+  invokeMcpTool,
+  isUnknownToolMessage,
+  resolveActiveWorkTimeoutMs,
+} from "./invoke";
 import { deriveMcpNamespace, type McpToolManifestEntry } from "./manifest";
 import { mcpPresets } from "./presets";
 import { probeMcpEndpointShape, type McpShapeProbeResult } from "./probe-shape";
@@ -543,8 +548,10 @@ const toToolDef = (entry: McpToolManifestEntry): ToolDef => {
     ...(entry.annotations ? { upstream: entry.annotations } : {}),
     ...(entry._meta ? { _meta: entry._meta } : {}),
   };
+  const maxDurationMs = declaredMaxDurationMs(entry._meta);
   const annotations: StampedAnnotations = {
     requiresApproval: destructive,
+    ...(maxDurationMs === undefined ? {} : { maxDurationMs }),
     ...(destructive ? { approvalDescription: entry.annotations?.title ?? entry.toolName } : {}),
     mcp: stamp,
   };
@@ -938,6 +945,12 @@ export interface McpPluginOptions {
    */
   readonly dangerouslyAllowStdioMCP?: boolean;
   readonly httpClientLayer?: Layer.Layer<HttpClient.HttpClient>;
+  /**
+   * Default active-work deadline for one tool call, in ms (15 minutes when
+   * unset). A tool can declare its own through `_meta["posse/maxDurationMs"]`;
+   * either way the deadline never exceeds 90 minutes.
+   */
+  readonly activeWorkTimeoutMs?: number;
 }
 
 export const mcpPlugin = definePlugin((options?: McpPluginOptions) => {
@@ -1711,6 +1724,10 @@ export const mcpPlugin = definePlugin((options?: McpPluginOptions) => {
           connector,
           ...(poolKey === undefined ? {} : { connectionPool, connectionPoolKey: poolKey }),
           elicit,
+          activeWorkTimeoutMs: resolveActiveWorkTimeoutMs(
+            options?.activeWorkTimeoutMs,
+            stamp._meta,
+          ),
           onToolListChanged: () => {
             toolListChanged = true;
           },

@@ -672,6 +672,40 @@ export const makeMutableCatalogMcpServer = (
   return { factory, renameTool, initialToolName, renamedToolName };
 };
 
+export const makeLongRunningToolsMcpServer = () => {
+  const server = new McpServer(
+    { name: "long-running-test-server", version: "1.0.0" },
+    { capabilities: {} },
+  );
+
+  server.registerTool(
+    "marathon",
+    {
+      description: "A tool that declares a 90 minute call",
+      inputSchema: {},
+      _meta: { "posse/maxDurationMs": 5_400_000 },
+    },
+    async () => ({ content: [] }),
+  );
+
+  server.registerTool(
+    "endless",
+    {
+      description: "A tool that declares more than the ceiling",
+      inputSchema: {},
+      _meta: { "posse/maxDurationMs": 99_999_999_999 },
+    },
+    async () => ({ content: [] }),
+  );
+  server.registerTool(
+    "ping",
+    { description: "A tool declaring no duration", inputSchema: {} },
+    async () => ({ content: [] }),
+  );
+
+  return server;
+};
+
 export const makeAnnotationsMcpServer = () => {
   const server = new McpServer(
     { name: "annotations-test-server", version: "1.0.0" },

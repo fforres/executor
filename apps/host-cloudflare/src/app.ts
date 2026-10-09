@@ -46,7 +46,9 @@ export const makeCloudflareApp = async (
   /** The opened D1 handle, when the caller already has one to share. */
   sharedDbHandle?: ExecutorDbHandle,
 ) => {
-  const plugins = makeCloudflarePlugins(config.secretKey);
+  const plugins = makeCloudflarePlugins(config.secretKey, {
+    mcpActiveWorkTimeoutMs: config.mcpActiveWorkTimeoutMs,
+  });
 
   // Load the Workers-compatible (WASM-inlined) QuickJS variant before any
   // executor is built, the default variant cannot fetch its .wasm on Workers.

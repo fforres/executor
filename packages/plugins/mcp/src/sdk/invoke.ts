@@ -50,7 +50,48 @@ import {
  * the normal deadline and is paused while one or more elicitation handlers are
  * waiting for input.
  */
-export const MCP_ACTIVE_WORK_TIMEOUT_MS = 60_000;
+export const MCP_ACTIVE_WORK_TIMEOUT_MS = 15 * 60_000;
+/** Hard ceiling for any tool's active-work deadline, however it was declared. */
+export const MCP_ACTIVE_WORK_MAX_TIMEOUT_MS = 90 * 60_000;
+/** Tool `_meta` key a server uses to declare how long one call may run (ms). */
+export const MCP_TOOL_MAX_DURATION_META_KEY = "posse/maxDurationMs";
+
+const isPositiveMillis = (value: unknown): value is number =>
+  typeof value === "number" && Number.isFinite(value) && value > 0;
+
+/**
+ * Active-work budget for one tool call: the tool's declared
+ * `_meta["posse/maxDurationMs"]` when valid, else the configured default,
+ * never above {@link MCP_ACTIVE_WORK_MAX_TIMEOUT_MS}.
+ */
+export const resolveActiveWorkTimeoutMs = (
+  defaultMs: number | undefined,
+  meta: Readonly<Record<string, unknown>> | undefined,
+): number => {
+  const base =
+    declaredMaxDurationMs(meta) ??
+    (isPositiveMillis(defaultMs) ? defaultMs : MCP_ACTIVE_WORK_TIMEOUT_MS);
+  return Math.min(Math.floor(base), MCP_ACTIVE_WORK_MAX_TIMEOUT_MS);
+};
+
+/** The tool's declared per-call maximum in ms, clamped to the 90 minute ceiling; undefined when absent or invalid. */
+export const declaredMaxDurationMs = (
+  meta: Readonly<Record<string, unknown>> | undefined,
+): number | undefined => {
+  const declared = meta?.[MCP_TOOL_MAX_DURATION_META_KEY];
+  return isPositiveMillis(declared)
+    ? Math.min(Math.floor(declared), MCP_ACTIVE_WORK_MAX_TIMEOUT_MS)
+    : undefined;
+};
+
+/** Parse a configured default (env var text); unset or invalid gives the built-in default. */
+export const parseActiveWorkTimeoutMs = (value: string | undefined): number | undefined => {
+  if (value === undefined || value.trim() === "") return undefined;
+  const parsed = Number(value);
+  return isPositiveMillis(parsed)
+    ? Math.min(Math.floor(parsed), MCP_ACTIVE_WORK_MAX_TIMEOUT_MS)
+    : undefined;
+};
 const MCP_SDK_TIMEOUT_BACKSTOP_MS = 2_147_483_647;
 
 export type ActiveWorkDeadline = {
@@ -361,10 +402,11 @@ const useConnection = (
   args: Record<string, unknown>,
   elicit: Elicit,
   onToolListChanged: (() => void) | undefined,
+  activeWorkTimeoutMs: number | undefined,
 ): Effect.Effect<unknown, McpInvocationError | McpOAuthReauthorizationRequired> =>
   Effect.gen(function* () {
     const deadline = yield* Effect.acquireRelease(
-      Effect.sync(() => makeActiveWorkDeadline()),
+      Effect.sync(() => makeActiveWorkDeadline(activeWorkTimeoutMs)),
       (activeWork) => Effect.sync(activeWork.dispose),
     );
     installElicitationHandler(connection.client, elicit, deadline);
@@ -452,6 +494,8 @@ export interface InvokeMcpToolInput {
    *  the call window. Synchronous and non-throwing by contract; the caller
    *  uses it to mark the persisted catalog stale. */
   readonly onToolListChanged?: () => void;
+  /** Active-work deadline for this call in ms; defaults to {@link MCP_ACTIVE_WORK_TIMEOUT_MS}. */
+  readonly activeWorkTimeoutMs?: number;
 }
 
 export const invokeMcpTool = (
@@ -463,7 +507,14 @@ export const invokeMcpTool = (
   Effect.gen(function* () {
     const args = argsRecord(input.args);
     const use = (connection: McpConnection) =>
-      useConnection(connection, input.toolName, args, input.elicit, input.onToolListChanged);
+      useConnection(
+        connection,
+        input.toolName,
+        args,
+        input.elicit,
+        input.onToolListChanged,
+        input.activeWorkTimeoutMs,
+      );
 
     if (input.connectionPool && input.connectionPoolKey) {
       return yield* input.connectionPool.withConnection(

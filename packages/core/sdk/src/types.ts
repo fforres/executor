@@ -23,6 +23,7 @@ export const ToolAnnotationsView = Schema.Struct({
   requiresApproval: Schema.optional(Schema.Boolean),
   approvalDescription: Schema.optional(Schema.String),
   mayElicit: Schema.optional(Schema.Boolean),
+  maxDurationMs: Schema.optional(Schema.Number),
 });
 export type ToolAnnotationsView = typeof ToolAnnotationsView.Type;
 

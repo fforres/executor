@@ -28,7 +28,11 @@ import { createMcpConnector } from "./connection";
 import { mcpPlugin, userFacingProbeMessage, toIntegrationConfig } from "./plugin";
 import { McpInvocationError } from "./errors";
 import { extractManifestFromListToolsResult, deriveMcpNamespace, joinToolPath } from "./manifest";
-import { makeAnnotationsMcpServer, serveMcpServer } from "../testing";
+import {
+  makeAnnotationsMcpServer,
+  makeLongRunningToolsMcpServer,
+  serveMcpServer,
+} from "../testing";
 
 // removed: the v1 addSource / scopes / secrets / credential-binding / usages /
 // sources.configure / multi-scope shadowing suites. v2 has no scope stack, no
@@ -1437,6 +1441,23 @@ describe("MCP destructiveHint → requiresApproval", () => {
       const pingTool = tools.find((t) => String(t.name) === "ping");
       expect(pingTool?.annotations?.requiresApproval).toBeFalsy();
     }),
+  );
+
+  it.effect(
+    "a declared posse/maxDurationMs reaches the tool annotations, clamped to 90 minutes",
+    () =>
+      Effect.gen(function* () {
+        const server = yield* serveMcpServer(makeLongRunningToolsMcpServer);
+        const executor = yield* seedAnnotationsExecutor(server.url);
+
+        const tools = yield* executor.tools.list();
+        const durationOf = (name: string) =>
+          tools.find((t) => String(t.name) === name)?.annotations?.maxDurationMs;
+
+        expect(durationOf("marathon")).toBe(5_400_000);
+        expect(durationOf("endless")).toBe(5_400_000);
+        expect(durationOf("ping")).toBeUndefined();
+      }),
   );
 
   it.effect("uses annotations.title as approvalDescription when present", () =>

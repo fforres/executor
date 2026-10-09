@@ -22,7 +22,13 @@ import { createMcpConnector, type McpConnection, type McpConnector } from "./con
 // that precondition here — these tests construct SDK errors directly.
 beforeAll(() => loadMcpClientSdk());
 import { McpInvocationError, McpOAuthReauthorizationRequired } from "./errors";
-import { invokeMcpTool, makeActiveWorkDeadline, MCP_ACTIVE_WORK_TIMEOUT_MS } from "./invoke";
+import {
+  invokeMcpTool,
+  makeActiveWorkDeadline,
+  MCP_ACTIVE_WORK_TIMEOUT_MS,
+  parseActiveWorkTimeoutMs,
+  resolveActiveWorkTimeoutMs,
+} from "./invoke";
 
 const acceptAll = () => Effect.succeed(ElicitationResponse.make({ action: "accept" }));
 
@@ -164,8 +170,104 @@ const invocationRejectionCases = [
   },
 ];
 
+describe("active-work timeout resolution", () => {
+  it("defaults to 15 minutes", () => {
+    expect(MCP_ACTIVE_WORK_TIMEOUT_MS).toBe(900_000);
+    expect(resolveActiveWorkTimeoutMs(undefined, undefined)).toBe(900_000);
+  });
+
+  it("uses the configured default when the tool declares nothing", () => {
+    expect(resolveActiveWorkTimeoutMs(120_000, {})).toBe(120_000);
+  });
+
+  it("honours a tool's declared maximum, up to 90 minutes", () => {
+    expect(resolveActiveWorkTimeoutMs(900_000, { "posse/maxDurationMs": 3_600_000 })).toBe(
+      3_600_000,
+    );
+    expect(resolveActiveWorkTimeoutMs(900_000, { "posse/maxDurationMs": 5_400_000 })).toBe(
+      5_400_000,
+    );
+  });
+
+  it("clamps a declared maximum above 90 minutes and a configured default above 90 minutes", () => {
+    expect(resolveActiveWorkTimeoutMs(900_000, { "posse/maxDurationMs": 5_400_001 })).toBe(
+      5_400_000,
+    );
+    expect(resolveActiveWorkTimeoutMs(10_000_000, undefined)).toBe(5_400_000);
+  });
+
+  it("ignores a declared maximum that is not a positive number", () => {
+    for (const bad of ["soon", -5, 0, null]) {
+      expect(resolveActiveWorkTimeoutMs(300_000, { "posse/maxDurationMs": bad })).toBe(300_000);
+    }
+  });
+
+  it("parses the env var text, ignoring blanks and garbage", () => {
+    expect(parseActiveWorkTimeoutMs("1200000")).toBe(1_200_000);
+    expect(parseActiveWorkTimeoutMs("99999999999")).toBe(5_400_000);
+    expect(parseActiveWorkTimeoutMs("")).toBeUndefined();
+    expect(parseActiveWorkTimeoutMs("abc")).toBeUndefined();
+    expect(parseActiveWorkTimeoutMs(undefined)).toBeUndefined();
+  });
+});
+
 describe("invokeMcpTool", () => {
   afterEach(() => vi.useRealTimers());
+
+  const slowCall = (options: { activeWorkTimeoutMs?: number }) => {
+    let signal: AbortSignal | undefined;
+    const client = {
+      setRequestHandler: () => undefined,
+      callTool: (_request: unknown, callOptions: { signal: AbortSignal }) => {
+        signal = callOptions.signal;
+        // oxlint-disable-next-line executor/no-promise-reject -- boundary: fake MCP client models SDK abort rejection
+        return new Promise<never>((_resolve, reject) => {
+          callOptions.signal.addEventListener("abort", () => reject(callOptions.signal.reason), {
+            once: true,
+          });
+        });
+      },
+    };
+    const invocation = Effect.runPromise(
+      invokeMcpTool({
+        toolId: "slow",
+        toolName: "slow",
+        args: {},
+        transport: "streamable-http",
+        connector: Effect.succeed({
+          // oxlint-disable-next-line executor/no-double-cast -- boundary: minimal fake MCP client implements only invokeMcpTool's surface
+          client: client as unknown as McpConnection["client"],
+          close: () => Promise.resolve(),
+        }),
+        elicit: acceptAll,
+        ...options,
+      }),
+    ).then(
+      () => "completed" as const,
+      () => "failed" as const,
+    );
+    return { invocation, aborted: () => signal?.aborted };
+  };
+
+  it("aborts a call with no declared limit at exactly 15 minutes", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const call = slowCall({});
+    await vi.advanceTimersByTimeAsync(MCP_ACTIVE_WORK_TIMEOUT_MS - 1);
+    expect(call.aborted()).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(call.aborted()).toBe(true);
+    expect(await call.invocation).toBe("failed");
+  });
+
+  it("lets a call run to its own 90 minute limit", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const call = slowCall({ activeWorkTimeoutMs: 5_400_000 });
+    await vi.advanceTimersByTimeAsync(5_399_999);
+    expect(call.aborted()).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(call.aborted()).toBe(true);
+    expect(await call.invocation).toBe("failed");
+  });
 
   it("pauses the active-work deadline across overlapping elicitations", () => {
     vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });

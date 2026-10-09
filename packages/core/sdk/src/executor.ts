@@ -1278,6 +1278,7 @@ const toolAnnotationsView = (
     requiresApproval?: boolean;
     approvalDescription?: string;
     mayElicit?: boolean;
+    maxDurationMs?: number;
   } = {};
   if (typeof annotations.requiresApproval === "boolean") {
     view.requiresApproval = annotations.requiresApproval;
@@ -1286,6 +1287,7 @@ const toolAnnotationsView = (
     view.approvalDescription = annotations.approvalDescription;
   }
   if (typeof annotations.mayElicit === "boolean") view.mayElicit = annotations.mayElicit;
+  if (typeof annotations.maxDurationMs === "number") view.maxDurationMs = annotations.maxDurationMs;
   return Object.keys(view).length > 0 ? ToolAnnotationsView.make(view) : undefined;
 };
 

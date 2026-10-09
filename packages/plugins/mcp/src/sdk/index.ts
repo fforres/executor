@@ -14,6 +14,13 @@ export {
 } from "./plugin";
 
 export {
+  MCP_ACTIVE_WORK_MAX_TIMEOUT_MS,
+  MCP_ACTIVE_WORK_TIMEOUT_MS,
+  MCP_TOOL_MAX_DURATION_META_KEY,
+  parseActiveWorkTimeoutMs,
+} from "./invoke";
+
+export {
   McpAuthMethod,
   McpAuthMethodInput,
   McpAuthShorthand,
