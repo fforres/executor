@@ -36,6 +36,9 @@ import {
   makeCloudflareToolDiscovery,
 } from "../execution";
 import { preloadQuickJs } from "../quickjs";
+import { refreshCatalog, type RefreshCatalogResult } from "./refresh";
+
+export type { RefreshCatalogResult };
 
 // ---------------------------------------------------------------------------
 // The tool service behind every non-MCP door (REST `/api/tools/*` and the
@@ -94,6 +97,11 @@ export interface ToolsService {
     origin?: string,
   ) => Promise<InvokeToolResult>;
   readonly overview: (principal: Principal, origin?: string) => Promise<PassthroughOverview>;
+  readonly refresh: (
+    principal: Principal,
+    input: unknown,
+    origin?: string,
+  ) => Promise<RefreshCatalogResult>;
 }
 
 const decodeSearch = Schema.decodeUnknownOption(PassthroughSearchInput);
@@ -194,6 +202,15 @@ export const makeCloudflareToolsService = (
       ),
     );
 
+  const internalHostnames: ReadonlySet<string> = new Set(Object.keys(config.internalHosts));
+
+  const refresh = (principal: Principal, input: unknown, origin?: string) =>
+    Effect.runPromise(
+      withExecutor(principal, origin, (executor) =>
+        refreshCatalog(executor, internalHostnames, input),
+      ),
+    );
+
   const invoke = (principal: Principal, input: unknown, origin?: string) => {
     const decoded = decodeInvoke(input);
     if (Option.isNone(decoded)) {
@@ -269,5 +286,5 @@ export const makeCloudflareToolsService = (
     );
   };
 
-  return { search, invoke, overview };
+  return { search, invoke, overview, refresh };
 };

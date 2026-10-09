@@ -11,6 +11,7 @@ import { mcpResourceFromPath } from "./mcp/resource";
 import {
   makeCloudflareToolsService,
   type InvokeToolResult,
+  type RefreshCatalogResult,
   type SearchToolsResult,
   type ToolsService,
 } from "./tools/service";
@@ -31,7 +32,7 @@ export { McpExecutionOwnerDirectoryDO, McpSessionDO } from "./mcp";
 //   - `ExecutorInternal` is the service-binding door, RPC only: workers in the
 //     same account reach it through a `services` binding with
 //     `entrypoint: "ExecutorInternal"` and call `searchTools`, `invokeTool` and
-//     `overview` as the owner with no credential. It has no `fetch`, builds its
+//     `overview` (and `refreshCatalog`, for integrations behind an internal host) as the owner with no credential. It has no `fetch`, builds its
 //     OWN config marked `trustedInternal`, and calls the tool service directly;
 //     nothing in `env` or in a request can switch the public door into that mode.
 // ---------------------------------------------------------------------------
@@ -141,6 +142,12 @@ export class ExecutorInternal extends WorkerEntrypoint<CloudflareEnv> {
     const { owner, overview } = await internalTools(this.env);
     return overview(owner);
   }
+
+  /** Re-list an org connection's tools now, for integrations behind an internal host. */
+  async refreshCatalog(input: RefreshCatalogInput): Promise<RefreshCatalogResult> {
+    const { owner, refresh } = await internalTools(this.env);
+    return refresh(owner, input);
+  }
 }
 
 export interface SearchToolsInput {
@@ -151,6 +158,11 @@ export interface SearchToolsInput {
   readonly connection?: string;
   readonly limit?: number;
   readonly offset?: number;
+}
+
+export interface RefreshCatalogInput {
+  readonly integration: string;
+  readonly connection?: "main";
 }
 
 export interface InvokeToolInput {
