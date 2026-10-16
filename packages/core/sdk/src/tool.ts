@@ -12,6 +12,8 @@ export interface ToolAnnotations {
   readonly requiresApproval?: boolean;
   readonly approvalDescription?: string;
   readonly mayElicit?: boolean;
+  /** The tool only reads (MCP: the upstream `readOnlyHint`, read from the plugin's stamp when not set directly). */
+  readonly readOnlyHint?: boolean;
   /** Longest one call may run, in ms, when the plugin knows it (MCP: `_meta["posse/maxDurationMs"]`). */
   readonly maxDurationMs?: number;
 }

@@ -1443,6 +1443,25 @@ describe("MCP destructiveHint → requiresApproval", () => {
     }),
   );
 
+  it.effect("an upstream readOnlyHint reaches the tool schema view", () =>
+    Effect.gen(function* () {
+      const server = yield* serveAnnotationsTestServer;
+      const executor = yield* seedAnnotationsExecutor(server.url);
+
+      const tools = yield* executor.tools.list();
+      const readOnlyOf = (name: string) =>
+        Effect.gen(function* () {
+          const tool = tools.find((t) => String(t.name) === name);
+          const view = tool ? yield* executor.tools.schema(tool.address) : null;
+          return view?.annotations?.readOnlyHint;
+        });
+
+      expect(yield* readOnlyOf("list")).toBe(true);
+      expect(yield* readOnlyOf("ping")).toBeUndefined();
+      expect(yield* readOnlyOf("delete")).toBeUndefined();
+    }),
+  );
+
   it.effect(
     "a declared posse/maxDurationMs reaches the tool annotations, clamped to 90 minutes",
     () =>

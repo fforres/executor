@@ -1267,9 +1267,14 @@ const rowToTool = (
 
 // Projects a tool's annotations onto the schema view. Plugins persist extra
 // keys alongside the declared contract (the mcp plugin stores its upstream tool
-// name and `_meta` there so they survive to invokeTool), so the three declared
+// name and `_meta` there so they survive to invokeTool), so the declared
 // fields are picked explicitly rather than spread: a caller reading the view
 // gets the contract in `tool.ts` and nothing a plugin keeps for itself.
+const upstreamReadOnlyHint = (annotations: ToolAnnotations): unknown => {
+  const { mcp } = annotations as { readonly mcp?: { readonly upstream?: { readonly readOnlyHint?: unknown } } };
+  return mcp?.upstream?.readOnlyHint;
+};
+
 const toolAnnotationsView = (
   annotations: ToolAnnotations | undefined,
 ): ToolAnnotationsView | undefined => {
@@ -1278,6 +1283,7 @@ const toolAnnotationsView = (
     requiresApproval?: boolean;
     approvalDescription?: string;
     mayElicit?: boolean;
+    readOnlyHint?: boolean;
     maxDurationMs?: number;
   } = {};
   if (typeof annotations.requiresApproval === "boolean") {
@@ -1287,6 +1293,8 @@ const toolAnnotationsView = (
     view.approvalDescription = annotations.approvalDescription;
   }
   if (typeof annotations.mayElicit === "boolean") view.mayElicit = annotations.mayElicit;
+  const readOnly = annotations.readOnlyHint ?? upstreamReadOnlyHint(annotations);
+  if (typeof readOnly === "boolean") view.readOnlyHint = readOnly;
   if (typeof annotations.maxDurationMs === "number") view.maxDurationMs = annotations.maxDurationMs;
   return Object.keys(view).length > 0 ? ToolAnnotationsView.make(view) : undefined;
 };
